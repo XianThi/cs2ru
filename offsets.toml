@@ -1,0 +1,59 @@
+[offsets]
+entityList = 0x24B3268
+viewMatrix = 0x2313F10
+localPlayerController = 0x22F8028
+globalVars = 0x2062540
+plantedC4 = 0x2318A60
+buildNumber = 0x60E514
+
+[offsets.controller]
+m_iPing = 0x828
+m_hPawn = 0x6C4
+m_steamID = 0x780
+m_iszPlayerName = 0x6F8
+m_bIsLocalPlayerController = 0x788
+m_pInGameMoneyServices = 0x808
+m_iAccount = 0x40
+
+[offsets.pawn]
+m_vOldOrigin = 0x1588
+m_iHealth = 0x354
+m_iTeamNum = 0x3F3
+m_bIsScoped = 0x26F8
+m_ArmorValue = 0x272C
+m_bIsDefusing = 0x26FA
+m_pGameSceneNode = 0x338
+m_pClippingWeapon = 0x3DC0
+m_entitySpottedState = 0x26E0
+m_bSpottedByMask = 0xC
+m_flFlashOverlayAlpha = 0x15EC
+
+[offsets.bomb]
+m_isPlanted = 0x8
+m_bC4Activated = 0x11B8
+m_nBombSite = 0x1174
+m_vecAbsOrigin = 0xD0
+
+[offsets.bone]
+m_modelState = 0x160
+
+[offsets.global_vars]
+maxClients = 0x10
+currentMapName = 0x180
+currentTime = 0x2C
+
+[offsets.signatures]
+viewMatrix = "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06"
+globalVars = "48 89 15 ?? ?? ?? ?? 48 89 42"
+entityList = "48 8B 0D ?? ?? ?? ?? 48 89 7C 24 ?? 8B FA C1 EB"
+localPlayerController = "48 8B 05 ?? ?? ?? ?? 41 89 BE"
+plantedC4 = "48 8b 15 ?? ?? ?? ?? 41 FF C0 48 8D 4C 24 ?? 44 89 05 ?? ?? ?? ??"
+weaponC4 = "48 89 05 ?? ?? ?? ?? F7 C1 ?? ?? ?? ?? 74 ?? 81 E1 ?? ?? ?? ?? 89 0D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 89 1D ?? ?? ?? ?? EB ?? 48 8B 15 ?? ?? ?? ?? 48 8B 5C 24 ?? FF C0 89 05 ?? ?? ?? ?? 48 8B C6 48 89 34 EA 80 BE"
+buildNumber = "89 05 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? ff 15 ?? ?? ?? ?? 48 8b 0d"
+
+[options]
+glowESPEnabled = true
+triggerBotEnabled = true
+autoBHOPEnabled = true
+soundESPEnabled = true
+rcsEnabled = true
