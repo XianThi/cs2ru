@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::time::Duration;
 
+pub const DEFAULT_OFFSETS_URL: &str = "https://raw.githubusercontent.com/a2x/cs2-dumper/master/output/offsets.json";
+pub const DEFAULT_CLIENT_DLL_URL: &str = "https://raw.githubusercontent.com/a2x/cs2-dumper/master/output/client_dll.json";
+
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerOffsets {
     pub m_iPing: usize,
@@ -27,6 +33,7 @@ impl Default for ControllerOffsets {
     }
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PawnOffsets {
     pub m_vOldOrigin: usize,
@@ -60,6 +67,7 @@ impl Default for PawnOffsets {
     }
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BombOffsets {
     pub m_isPlanted: usize,
@@ -79,6 +87,7 @@ impl Default for BombOffsets {
     }
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoneOffsets {
     pub m_modelState: usize,
@@ -90,7 +99,7 @@ impl Default for BoneOffsets {
     }
 }
 
-
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalVarsOffsets {
     pub maxClients: usize,
@@ -108,7 +117,7 @@ impl Default for GlobalVarsOffsets {
     }
 }
 
-
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signatures {
     pub viewMatrix: String,
@@ -134,7 +143,7 @@ impl Default for Signatures {
     }
 }
 
-
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameOptions {
     pub glowESPEnabled: bool,
@@ -156,7 +165,7 @@ impl Default for GameOptions {
     }
 }
 
-
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OffsetsConfig {
     pub entityList: u64,
@@ -192,11 +201,71 @@ impl Default for OffsetsConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameConfig {
     pub offsets: OffsetsConfig,
     pub options: GameOptions,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            offsets: OffsetsConfig::default(),
+            options: GameOptions::default(),
+        }
+    }
+}
+
+fn find_class_field_offset(classes: &Value, field_name: &str, preferred_class: Option<&str>) -> Option<usize> {
+    if let Some(pref) = preferred_class {
+        if let Some(val) = classes
+            .get(pref)
+            .and_then(|c| c.get("fields"))
+            .and_then(|f| f.get(field_name))
+            .and_then(|v| v.as_u64())
+        {
+            return Some(val as usize);
+        }
+    }
+
+    if let Some(map) = classes.as_object() {
+        for (_class_name, class_val) in map {
+            if let Some(fields) = class_val.get("fields").and_then(|f| f.as_object()) {
+                if let Some(val) = fields.get(field_name).and_then(|v| v.as_u64()) {
+                    return Some(val as usize);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn fetch_json_from_url(url: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .user_agent("cs2ru/1.0")
+        .build();
+    let body = agent.get(url)
+        .call()?
+        .into_string()?;
+    let value: Value = serde_json::from_str(&body)?;
+    Ok(value)
+}
+
+#[allow(dead_code)]
+pub fn update_offsets_from_web(config: &mut GameConfig) -> Result<(), Box<dyn std::error::Error>> {
+    config.update_from_web()
+}
+
+#[allow(dead_code)]
+pub fn update_offsets_from_urls(
+    config: &mut GameConfig,
+    offsets_url: &str,
+    client_dll_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    config.update_from_network(offsets_url, client_dll_url)
 }
 
 impl GameConfig {
@@ -205,18 +274,18 @@ impl GameConfig {
         let config: GameConfig = toml::from_str(&content)?;
         Ok(config)
     }
-    
+
     pub fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let content = toml::to_string_pretty(self)?;
         fs::write(path, content)?;
         Ok(())
     }
-    
+
     pub fn from_dict(data: HashMap<String, HashMap<String, u64>>) -> Self {
-        let binding: HashMap<String,u64> = HashMap::new();
+        let binding: HashMap<String, u64> = HashMap::new();
         let client = data.get("client_dll").unwrap_or(&binding);
         let engine = data.get("engine2_dll").unwrap_or(&binding);
-        
+
         Self {
             offsets: OffsetsConfig {
                 entityList: *client.get("entitylist").unwrap_or(&0x24B0258),
@@ -229,5 +298,145 @@ impl GameConfig {
             },
             options: GameOptions::default(),
         }
+    }
+
+    pub fn update_from_network(
+        &mut self,
+        offsets_url: &str,
+        client_dll_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let offsets_json = fetch_json_from_url(offsets_url)?;
+        let client_json = fetch_json_from_url(client_dll_url)?;
+        self.apply_remote_offsets(&offsets_json, &client_json);
+        Ok(())
+    }
+
+    pub fn update_from_web(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.update_from_network(DEFAULT_OFFSETS_URL, DEFAULT_CLIENT_DLL_URL)
+    }
+
+    pub fn apply_remote_offsets(&mut self, offsets_json: &Value, client_json: &Value) {
+        if let Some(client_dll) = offsets_json.get("client.dll") {
+            if let Some(val) = client_dll.get("dwEntityList").and_then(|v| v.as_u64()) {
+                self.offsets.entityList = val;
+            }
+            if let Some(val) = client_dll.get("dwViewMatrix").and_then(|v| v.as_u64()) {
+                self.offsets.viewMatrix = val;
+            }
+            if let Some(val) = client_dll.get("dwLocalPlayerController").and_then(|v| v.as_u64()) {
+                self.offsets.localPlayerController = val;
+            }
+            if let Some(val) = client_dll.get("dwGlobalVars").and_then(|v| v.as_u64()) {
+                self.offsets.globalVars = val;
+            }
+            if let Some(val) = client_dll.get("dwPlantedC4").and_then(|v| v.as_u64()) {
+                self.offsets.plantedC4 = val;
+            }
+        }
+
+        if let Some(engine_dll) = offsets_json.get("engine2.dll") {
+            if let Some(val) = engine_dll.get("dwBuildNumber").and_then(|v| v.as_u64()) {
+                self.offsets.buildNumber = val;
+            }
+        }
+
+        if let Some(classes) = client_json.get("client.dll").and_then(|c| c.get("classes")) {
+            // Controller
+            if let Some(v) = find_class_field_offset(classes, "m_iPing", Some("CCSPlayerController")) {
+                self.offsets.controller.m_iPing = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_hPawn", Some("CBasePlayerController")) {
+                self.offsets.controller.m_hPawn = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_steamID", Some("CBasePlayerController")) {
+                self.offsets.controller.m_steamID = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_iszPlayerName", Some("CBasePlayerController")) {
+                self.offsets.controller.m_iszPlayerName = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_bIsLocalPlayerController", Some("CBasePlayerController")) {
+                self.offsets.controller.m_bIsLocalPlayerController = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_pInGameMoneyServices", Some("CCSPlayerController")) {
+                self.offsets.controller.m_pInGameMoneyServices = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_iAccount", Some("CCSPlayerController_InGameMoneyServices")) {
+                self.offsets.controller.m_iAccount = v;
+            }
+
+            // Pawn
+            if let Some(v) = find_class_field_offset(classes, "m_vOldOrigin", Some("C_BasePlayerPawn")) {
+                self.offsets.pawn.m_vOldOrigin = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_iHealth", Some("C_BaseEntity")) {
+                self.offsets.pawn.m_iHealth = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_iTeamNum", Some("C_BaseEntity")) {
+                self.offsets.pawn.m_iTeamNum = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_bIsScoped", Some("C_CSPlayerPawn")) {
+                self.offsets.pawn.m_bIsScoped = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_ArmorValue", Some("C_CSPlayerPawn")) {
+                self.offsets.pawn.m_ArmorValue = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_bIsDefusing", Some("C_CSPlayerPawn")) {
+                self.offsets.pawn.m_bIsDefusing = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_pGameSceneNode", Some("C_BaseEntity")) {
+                self.offsets.pawn.m_pGameSceneNode = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_pClippingWeapon", Some("C_CSPlayerPawnBase")) {
+                self.offsets.pawn.m_pClippingWeapon = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_entitySpottedState", Some("C_CSPlayerPawn")) {
+                self.offsets.pawn.m_entitySpottedState = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_bSpottedByMask", Some("EntitySpottedState_t")) {
+                self.offsets.pawn.m_bSpottedByMask = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_flFlashOverlayAlpha", Some("C_CSPlayerPawnBase")) {
+                self.offsets.pawn.m_flFlashOverlayAlpha = v;
+            }
+
+            // Bomb
+            if let Some(v) = find_class_field_offset(classes, "m_isPlanted", Some("C_PlantedC4")) {
+                self.offsets.bomb.m_isPlanted = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_bC4Activated", Some("C_PlantedC4")) {
+                self.offsets.bomb.m_bC4Activated = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_nBombSite", Some("C_PlantedC4")) {
+                self.offsets.bomb.m_nBombSite = v;
+            }
+            if let Some(v) = find_class_field_offset(classes, "m_vecAbsOrigin", Some("CGameSceneNode")) {
+                self.offsets.bomb.m_vecAbsOrigin = v;
+            }
+
+            // Bone
+            if let Some(v) = find_class_field_offset(classes, "m_modelState", Some("CSkeletonInstance")) {
+                self.offsets.bone.m_modelState = v;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_offsets_from_web() {
+        let mut config = GameConfig::default();
+        let result = config.update_from_web();
+        assert!(result.is_ok(), "Offset güncellemesi başarısız oldu: {:?}", result.err());
+        assert_ne!(config.offsets.entityList, 0);
+        assert_ne!(config.offsets.viewMatrix, 0);
+        assert_ne!(config.offsets.controller.m_iPing, 0);
+        assert_ne!(config.offsets.pawn.m_vOldOrigin, 0);
+        assert_ne!(config.offsets.pawn.m_iHealth, 0);
+        println!("Updated entityList: 0x{:X}", config.offsets.entityList);
+        println!("Updated viewMatrix: 0x{:X}", config.offsets.viewMatrix);
+        println!("Updated m_iPing: 0x{:X}", config.offsets.controller.m_iPing);
     }
 }

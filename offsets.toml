@@ -1,46 +1,46 @@
 [offsets]
-entityList = 0x24B3268
-viewMatrix = 0x2313F10
-localPlayerController = 0x22F8028
-globalVars = 0x2062540
-plantedC4 = 0x2318A60
-buildNumber = 0x60E514
+entityList = 40931344
+viewMatrix = 39163456
+localPlayerController = 38973640
+globalVars = 35789496
+plantedC4 = 38509456
+buildNumber = 7023896
 
 [offsets.controller]
-m_iPing = 0x828
-m_hPawn = 0x6C4
-m_steamID = 0x780
-m_iszPlayerName = 0x6F8
-m_bIsLocalPlayerController = 0x788
-m_pInGameMoneyServices = 0x808
-m_iAccount = 0x40
+m_iPing = 2104
+m_hPawn = 1724
+m_steamID = 1928
+m_iszPlayerName = 1788
+m_bIsLocalPlayerController = 1936
+m_pInGameMoneyServices = 2072
+m_iAccount = 64
 
 [offsets.pawn]
-m_vOldOrigin = 0x1588
-m_iHealth = 0x354
-m_iTeamNum = 0x3F3
-m_bIsScoped = 0x26F8
-m_ArmorValue = 0x272C
-m_bIsDefusing = 0x26FA
-m_pGameSceneNode = 0x338
-m_pClippingWeapon = 0x3DC0
-m_entitySpottedState = 0x26E0
-m_bSpottedByMask = 0xC
-m_flFlashOverlayAlpha = 0x15EC
+m_vOldOrigin = 5284
+m_iHealth = 844
+m_iTeamNum = 999
+m_bIsScoped = 7888
+m_ArmorValue = 7936
+m_bIsDefusing = 7890
+m_pGameSceneNode = 816
+m_pClippingWeapon = 15808
+m_entitySpottedState = 7864
+m_bSpottedByMask = 12
+m_flFlashOverlayAlpha = 5380
 
 [offsets.bomb]
-m_isPlanted = 0x8
-m_bC4Activated = 0x11B8
-m_nBombSite = 0x1174
-m_vecAbsOrigin = 0xD0
+m_isPlanted = 8
+m_bC4Activated = 4816
+m_nBombSite = 4748
+m_vecAbsOrigin = 200
 
 [offsets.bone]
-m_modelState = 0x160
+m_modelState = 320
 
 [offsets.global_vars]
-maxClients = 0x10
-currentMapName = 0x180
-currentTime = 0x2C
+maxClients = 16
+currentMapName = 384
+currentTime = 44
 
 [offsets.signatures]
 viewMatrix = "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06"

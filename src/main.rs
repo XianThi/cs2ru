@@ -1,126 +1,212 @@
-use sysmemkit::SysMemKit;
+mod app;
 mod matrix;
 mod offset;
 mod player;
 mod sound;
 mod utils;
 mod vec3;
-use matrix::ViewMatrix;
-use offset::GameConfig;
-use player::Player;
-use rodio::OutputStream;
-use rodio::{OutputStreamHandle, Source, source::SineWave};
-use sound::StereoSine;
-use std::f32::consts::PI;
+
+use crate::app::App;
+use crate::offset::GameConfig;
+use crate::player::Player;
+use std::io::{self, Write};
 use std::sync::mpsc::channel;
-use std::thread;
-use std::time::{Duration};
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
+use sysmemkit::{Mode, SysMemKit};
+
+fn select_mode() -> Mode {
+    println!("==================================================");
+    println!("             SYSMEMKIT ÇALIŞMA MODU               ");
+    println!("==================================================");
+    println!(" [1] Basic         - Seviye 1: Export Tablosu SSN + Direct Syscall");
+    println!(" [2] DirectStealth - Seviye 2: Hook-Aware Resolver + Direct Syscall");
+    println!(" [3] Indirect      - Seviye 3: Indirect Syscall Trampoline (Varsayılan)");
+    println!(" [4] Rage          - Seviye 4: Stack Unwind Frame / ROP Chain");
+    println!("==================================================");
+    print!("Çalışma modu seçin [1-4] (Varsayılan: 3): ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok() {
+        match input.trim() {
+            "1" => {
+                println!("[+] Seçilen mod: Basic");
+                Mode::Basic
+            }
+            "2" => {
+                println!("[+] Seçilen mod: DirectStealth");
+                Mode::DirectStealth
+            }
+            "3" => {
+                println!("[+] Seçilen mod: Indirect");
+                Mode::Indirect
+            }
+            "4" => {
+                println!("[+] Seçilen mod: Rage");
+                Mode::Rage
+            }
+            _ => {
+                println!("[*] Varsayılan mod seçildi: Indirect");
+                Mode::Indirect
+            }
+        }
+    } else {
+        println!("[*] Girdi okunamadı, varsayılan mod seçildi: Indirect");
+        Mode::Indirect
+    }
+}
 
 fn main() {
-    let config = GameConfig::load("offsets.toml").expect("Config yüklenemedi!");
+    let mode = select_mode();
+
+    println!("[*] Oyun tespiti için bekleniyor...");
+    sleep(Duration::from_secs(2)); // Oyun ve hedef sürecin hazır olması için bekle
+    let mut config = GameConfig::load("offsets.toml").unwrap_or_else(|_| {
+        println!("[!] offsets.toml bulunamadı, varsayılan yapılandırma oluşturuluyor...");
+        GameConfig::default()
+    });
+
+    println!("[*] Güncel offsetler GitHub üzerinden çekiliyor (a2x/cs2-dumper)...");
+    match config.update_from_web() {
+        Ok(_) => {
+            println!("[+] Offsetler internetten başarıyla güncellendi!");
+            if let Err(e) = config.save("offsets.toml") {
+                eprintln!("[!] Güncellenen offsetler offsets.toml dosyasına kaydedilemedi: {}", e);
+            } else {
+                println!("[+] Güncel offsetler offsets.toml dosyasına kaydedildi.");
+            }
+        }
+        Err(e) => {
+            eprintln!("[!] İnternetten offset çekilemedi: {}. Mevcut yerel offsetler kullanılacak.", e);
+        }
+    }
+
+    let mut app = App::new();
+
     unsafe {
-        let kit =
-            SysMemKit::new("cs2.exe", false).expect("Oyun bulunamadı veya handle çalınamadı!");
+        let kit: SysMemKit = SysMemKit::with_mode("cs2.exe", false, mode)
+            .expect("Oyun bulunamadı veya handle çalınamadı!");
+        println!(
+            "[+] SysMemKit başarıyla bağlandı! PID: {}, Mod: {:?}",
+            kit.get_pid(),
+            kit.mode()
+        );
+
         let clientdll = match kit.getmodule("client.dll") {
-            Some(dll) => dll,
+            Some(dll) => {
+                println!("[+] client.dll bulundu: 0x{:016X}", dll);
+                dll
+            }
             None => {
-                println!("client.dll bulunamadı");
+                println!("[!] client.dll bulunamadı! Yüklü modüller listeleniyor:");
+                for (name, base) in kit.list_modules() {
+                    println!("  - 0x{:016X}: {}", base, name);
+                }
                 return;
             }
         };
-        let engine2dll = match kit.getmodule("engine2.dll") {
-            Some(dll) => dll,
+
+        let _engine2dll = match kit.getmodule("engine2.dll") {
+            Some(dll) => {
+                println!("[+] engine2.dll bulundu: 0x{:016X}", dll);
+                dll
+            }
             None => {
-                println!("engine2.dll bulunamadı");
+                println!("[!] engine2.dll bulunamadı! Yüklü modüller listeleniyor:");
+                for (name, base) in kit.list_modules() {
+                    println!("  - 0x{:016X}: {}", base, name);
+                }
                 return;
             }
         };
-        if clientdll != 0 && engine2dll != 0 {
-            //let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-            let (tx, rx) = channel();
-            std::thread::spawn(move || StereoSine::audio_thread(rx));
-            loop {
-                let start_time = std::time::Instant::now();
-                let entitylist: usize = kit.read(clientdll + config.offsets.entityList as usize);
-                let list_entry: usize = kit.read(entitylist as usize + 0x10);
-                let local_player = find_local_player(&kit, &config, list_entry, clientdll);
-                let view_matrix_bytes =
-                    kit.read_buffer(clientdll + config.offsets.viewMatrix as usize, 64);
-                let view_matrix = ViewMatrix::from_bytes(&view_matrix_bytes);
-                if let Some(local) = local_player {
-                    //println!("local player bulundu {:?}", local.name);
-                    let forward = [
-                        view_matrix.matrix[0][2],
-                        view_matrix.matrix[1][2],
-                        view_matrix.matrix[2][2],
-                    ];
-                    let mut closest = vec![];
-                    for i in 0..64 {
-                        let mut player =
-                            Player::new(i, list_entry, &kit, &config.offsets, clientdll);
-                        //println!("player bulundu {:?}", player.name);
 
-                        if player.update(false) && player.alive && !player.localplayer {
-                            if player.team == local.team {
-                                continue;
-                            }
-                            let (l, r, dist) = utils::Utils::calculate_3d_audio(
-                                [local.pos.x, local.pos.y, local.pos.z],
-                                [player.pos.x, player.pos.y, player.pos.z],
-                                forward,
-                            );
-                            if dist < 2000.0 {
-                                closest.push((dist, l, r));
-                            }
-                            // if (player.pos.x - local.pos.x).abs() > 3000.0 {
-                            //     continue;
-                            // }
-                            // let delta_x = player.pos.x - local.pos.x;
-                            // let delta_y = player.pos.y - local.pos.y;
-                            // let delta_z = player.pos.z - local.pos.z;
-                            // let distance =
-                            //     (delta_x * delta_x + delta_y * delta_y + delta_z * delta_z).sqrt();
-                            // let angle = delta_y.atan2(delta_x);
-                            // if distance < 2000.0 {
-                            //     let volume = (1.0 - (distance / 2000.0)).max(0.1).min(1.0);
-                            //     // let pan = angle.sin();
-                            //     let frequency = 200.0 + (800.0 * volume);
-                            //     let handle = stream_handle.clone();
+        let (tx, rx) = channel();
+        thread::spawn(move || sound::StereoSine::audio_thread(rx));
 
-                            //     let (pan, volume) = calculate_3d_pan(angle);
-                            //     thread::spawn(move || {
-                            //         play_sound(&handle, frequency, volume, pan);
-                            //     });
+        println!("Hile aktif.");
+        println!("Shift+F1 ile Sound ESP'yi açıp kapatabilirsin.");
+        println!("Shift+F2 ile Visual ESP'yi açıp kapatabilirsin.");
+        loop {
+            let start_time = Instant::now();
 
-                            //     // println!(
-                            //     //     "[SOUND ESP] {} - Distance: {:.0} - Angle: {:.0}°",
-                            //     //     player.name,
-                            //     //     distance,
-                            //     //     angle.to_degrees()
-                            //     // );
-                            // }
-                        }
-                    }
-                    closest.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                    for (_, l, r) in closest.iter().take(3) {
-                        let _ = tx.send(sound::SoundEvent {
-                            left: *l,
-                            right: *r,
-                        });
-                    }
-                } else {
-                    println!("local player bulunamadı");
-                }
-                let elapsed = start_time.elapsed();
-                if elapsed < Duration::from_millis(16) {
-                    thread::sleep(Duration::from_millis(16) - elapsed);
-                }
+            app.update_input();
+            app.run_sound_esp(&kit, &config, clientdll, &tx);
+
+            let elapsed = start_time.elapsed();
+            if elapsed < Duration::from_millis(16) {
+                thread::sleep(Duration::from_millis(16) - elapsed);
             }
         }
     }
 }
 
-fn find_local_player<'a>(
+#[allow(dead_code)]
+fn fnv1a_hash(data: u32) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xCBF29CE484222325;
+    const FNV_PRIME: u64 = 0x100000001B3;
+
+    let bytes = data.to_le_bytes();
+    let mut hash = FNV_OFFSET_BASIS;
+    for b in bytes {
+        hash = hash ^ (b as u64);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[allow(dead_code)]
+fn analyze_shared_memory(kit: &SysMemKit, magic_addr: usize) {
+    unsafe {
+        let magic = kit.read::<u32>(magic_addr);
+        println!("Magic: 0x{:X}", magic);
+
+        let frame_count = kit.read::<u32>(magic_addr + 4);
+        println!("Frame count: {}", frame_count);
+
+        let width = kit.read::<u32>(magic_addr + 12);
+        println!("Width: {}", width);
+
+        let height = kit.read::<u32>(magic_addr + 16);
+        println!("Height: {}", height);
+
+        let framebuffer_ptr = kit.read::<usize>(magic_addr + 20);
+        println!("Framebuffer pointer: 0x{:X}", framebuffer_ptr);
+
+        if framebuffer_ptr != 0 {
+            let first_pixel = kit.read::<u32>(framebuffer_ptr);
+            println!("First pixel (BGRA): 0x{:08X}", first_pixel);
+        }
+
+        let overlay_info_addr = magic_addr - 32;
+        println!("\nTrying to find OverlayInfo at 0x{:X}", overlay_info_addr);
+
+        let message_window = kit.read::<usize>(overlay_info_addr);
+        let overlay_window = kit.read::<usize>(overlay_info_addr + 8);
+        println!("Message window handle: 0x{:X}", message_window);
+        println!("Overlay window handle: 0x{:X}", overlay_window);
+
+        for offset in -0x1000..0x1000 {
+            let addr = (magic_addr as isize + offset) as usize;
+            if addr < magic_addr - 0x2000 {
+                continue;
+            }
+
+            let hash = kit.read::<u64>(addr);
+            let ptr = kit.read::<usize>(addr + 8);
+
+            if hash > 0x1000000 && ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF {
+                println!(
+                    "Possible hash entry at 0x{:X}: hash=0x{:X}, ptr=0x{:X}",
+                    addr, hash, ptr
+                );
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn find_local_player<'a>(
     kit: &'a SysMemKit,
     config: &'a GameConfig,
     list_entry: usize,
@@ -133,32 +219,4 @@ fn find_local_player<'a>(
         }
     }
     None
-}
-
-// fn calculate_3d_pan(angle_degrees: f32) -> (f32, f32) {
-//     let angle_rad = angle_degrees.to_radians();
-//     let angle = angle_rad % (2.0 * PI);
-//     let left_right = angle.cos();
-//     let pan = left_right;
-//     let front_back = angle.sin().abs();
-//     let volume_factor = (0.7 + (front_back * 0.3)) * 0.5;
-
-//     (pan, volume_factor)
-// }
-
-// fn play_sound(handle: &OutputStreamHandle, frequency: f32, volume: f32, pan: f32) {
-//     let source = SineWave::new(frequency)
-//         .take_duration(Duration::from_millis(150))
-//         .amplify(volume);
-//     let _ = handle.play_raw(source);
-// }
-pub const fn dbj2_hash(s: &str) -> u32 {
-    let mut hash: u32 = 5381;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        hash = (hash << 5).wrapping_add(hash).wrapping_add(bytes[i] as u32);
-        i += 1;
-    }
-    hash
 }
