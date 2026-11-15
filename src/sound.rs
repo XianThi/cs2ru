@@ -1,4 +1,4 @@
-use rodio::Source;
+use rodio::{OutputStream, Sink, Source};
 use std::time::{Duration, Instant};
 pub struct SoundEvent {
     pub left: f32,
@@ -92,6 +92,3 @@ impl Source for StereoSine {
         Some(Duration::from_millis(120))
     }
 }
-
-use rodio::{OutputStream, Sink};
-use std::sync::mpsc::{Sender, channel};

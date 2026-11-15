@@ -1,5 +1,5 @@
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ViewMatrix {
     pub matrix: [[f32; 4]; 4],
 }

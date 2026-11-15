@@ -11,8 +11,9 @@ use crate::offset::GameConfig;
 use crate::player::Player;
 use std::io::{self, Write};
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::thread::{self, sleep};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use sysmemkit::{Mode, SysMemKit};
 
 fn select_mode() -> Mode {
@@ -82,8 +83,6 @@ fn main() {
         }
     }
 
-    let mut app = App::new();
-
     unsafe {
         let kit: SysMemKit = SysMemKit::with_mode("cs2.exe", false, mode)
             .expect("Oyun bulunamadı veya handle çalınamadı!");
@@ -124,20 +123,8 @@ fn main() {
         let (tx, rx) = channel();
         thread::spawn(move || sound::StereoSine::audio_thread(rx));
 
-        println!("Hile aktif.");
-        println!("Shift+F1 ile Sound ESP'yi açıp kapatabilirsin.");
-        println!("Shift+F2 ile Visual ESP'yi açıp kapatabilirsin.");
-        loop {
-            let start_time = Instant::now();
-
-            app.update_input();
-            app.run_sound_esp(&kit, &config, clientdll, &tx);
-
-            let elapsed = start_time.elapsed();
-            if elapsed < Duration::from_millis(16) {
-                thread::sleep(Duration::from_millis(16) - elapsed);
-            }
-        }
+        let app = App::new(config, Arc::new(kit), clientdll, tx);
+        app.run();
     }
 }
 
