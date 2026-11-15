@@ -1,4 +1,5 @@
 mod app;
+mod discord_overlay;
 mod matrix;
 mod offset;
 mod player;
@@ -59,6 +60,11 @@ fn select_mode() -> Mode {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--discord-selftest") {
+        discord_overlay::selftest();
+        return;
+    }
+
     let mode = select_mode();
 
     println!("[*] Oyun tespiti için bekleniyor...");

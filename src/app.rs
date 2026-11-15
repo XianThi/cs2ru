@@ -11,6 +11,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use overlay::{OverlayOptions, OverlayTarget};
 use sysmemkit::{Mode, SysMemKit};
 
+use crate::discord_overlay;
 use crate::matrix::ViewMatrix;
 use crate::offset::GameConfig;
 use crate::player::Player;
@@ -302,6 +303,14 @@ impl App {
                 );
             })
             .expect("Bellek okuma thread'i başlatılamadı");
+
+        // 1b. Discord V3 overlay köprüsü (CDP + canvas). Discord yoksa sessizce bekler.
+        let _discord_thread = discord_overlay::spawn(
+            Arc::clone(&self.snapshot),
+            Arc::clone(&self.settings),
+            Arc::clone(&self.visual_esp_enabled),
+            Arc::clone(&self.running),
+        );
 
         // 2. Ana thread: Overlay başlatma prosedürü
         let pid = self.kit.get_pid();
