@@ -5,14 +5,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_SHIFT,
+    GetAsyncKeyState, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F9, VK_F11, VK_INSERT, VK_LSHIFT,
+    VK_RSHIFT, VK_SHIFT,
 };
 
 use overlay::{OverlayOptions, OverlayTarget};
-use sysmemkit::{Mode, SysMemKit};
+use sysmemkit::Mode;
 
 use crate::discord_overlay;
+use crate::esp;
+use crate::hud;
 use crate::matrix::ViewMatrix;
+use crate::memory::MemoryRouter;
+use crate::mode::{ModeController, StealthMode};
 use crate::offset::GameConfig;
 use crate::player::Player;
 use crate::sound::SoundEvent;
@@ -92,9 +97,21 @@ pub struct PlayerSnapshot {
     pub head_pos: Vec3,
     pub bone_list: Vec<Vec3>,
     pub health: i32,
+    pub armor: i32,
     pub team: i32,
     pub name: String,
     pub weapon: String,
+    pub scoped: bool,
+    pub defusing: bool,
+    pub flashed: bool,
+}
+
+/// Kurulu C4 anlık durumu
+#[derive(Debug, Clone, Default)]
+pub struct PlantedC4Snapshot {
+    pub pos: Vec3,
+    pub site: i32,
+    pub is_planted: bool,
 }
 
 /// Çift thread arasında paylaşılan dünya ve oyuncu snapshot'ı
@@ -103,7 +120,10 @@ pub struct EspSnapshot {
     pub view_matrix: ViewMatrix,
     pub local_team: i32,
     pub has_local: bool,
+    pub is_in_game: bool,
+    pub map_name: String,
     pub players: Vec<PlayerSnapshot>,
+    pub planted_c4: Option<PlantedC4Snapshot>,
 }
 
 /// Kısayol tuşlarını dinleyen ve durumları güncelleyen işleyici
@@ -111,11 +131,17 @@ pub struct InputHandler {
     sound_esp_enabled: Arc<AtomicBool>,
     visual_esp_enabled: Arc<AtomicBool>,
     settings: Arc<RwLock<VisualSettings>>,
+    mode_controller: ModeController,
+    /// F9 ile mod değişince syscall katmanını da yeniden kurabilmek için.
+    memory: Arc<MemoryRouter>,
     f1_was_down: bool,
     f2_was_down: bool,
     f3_was_down: bool,
     f4_was_down: bool,
     f5_was_down: bool,
+    f9_was_down: bool,
+    f11_was_down: bool,
+    insert_was_down: bool,
 }
 
 impl InputHandler {
@@ -123,16 +149,23 @@ impl InputHandler {
         sound_esp_enabled: Arc<AtomicBool>,
         visual_esp_enabled: Arc<AtomicBool>,
         settings: Arc<RwLock<VisualSettings>>,
+        mode_controller: ModeController,
+        memory: Arc<MemoryRouter>,
     ) -> Self {
         Self {
             sound_esp_enabled,
             visual_esp_enabled,
             settings,
+            mode_controller,
+            memory,
             f1_was_down: false,
             f2_was_down: false,
             f3_was_down: false,
             f4_was_down: false,
             f5_was_down: false,
+            f9_was_down: false,
+            f11_was_down: false,
+            insert_was_down: false,
         }
     }
 
@@ -142,7 +175,9 @@ impl InputHandler {
     }
 
     pub fn update(&mut self) {
-        let shift = Self::is_key_down(VK_SHIFT);
+        let shift = Self::is_key_down(VK_SHIFT)
+            || Self::is_key_down(VK_LSHIFT)
+            || Self::is_key_down(VK_RSHIFT);
         let f1 = Self::is_key_down(VK_F1);
         let f2 = Self::is_key_down(VK_F2);
         let f3 = Self::is_key_down(VK_F3);
@@ -233,13 +268,74 @@ impl InputHandler {
         } else {
             self.f5_was_down = false;
         }
+
+        let f9 = Self::is_key_down(VK_F9);
+        let f11 = Self::is_key_down(VK_F11);
+        let insert = Self::is_key_down(VK_INSERT);
+
+        // F9: Stealth Mod Seviye Değişimi (1 -> 2 -> 3 -> 4 -> 1)
+        // Sıra önemli: önce syscall katmanı kurulur, başarılıysa mod commit edilir.
+        // Böylece "overlay Discord'a geçti ama syscall hâlâ direct" gibi yarım durum oluşmaz.
+        if f9 {
+            if !self.f9_was_down {
+                let target = self.mode_controller.mode().next();
+                let sys_result = self.memory.apply_mode(target.to_sys_mode());
+                println!();
+                println!("==================================================");
+                match sys_result {
+                    Ok(effective) => {
+                        let committed = StealthMode::from_sys_mode(effective);
+                        self.mode_controller.set_mode(committed);
+                        // ESP profili de moda bağlıdır (Rage -> minimal, Basic -> tam set).
+                        {
+                            let mut guard = self
+                                .settings
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            *guard = VisualSettings::default_for_mode(effective);
+                        }
+                        println!(">>> [MOD DEĞİŞTİRİLDİ]: {}", committed.name());
+                        println!(">>> [AKTİF OVERLAY]    : {}", committed.overlay_name());
+                        println!(">>> [SYSCALL KATMANI]  : {:?}", effective);
+                        println!(
+                            ">>> [NOT] Mod 3/4'te ImGui penceresi gizlenir; çizim Discord CDP üzerinden yapılır."
+                        );
+                    }
+                    Err(err) => {
+                        println!(">>> [MOD DEĞİŞTİRİLEMEDİ]: {}", target.name());
+                        println!(">>> [SYSCALL HATASI]     : {}", err);
+                        println!(">>> [NOT] Mod ve overlay yönlendirmesi değiştirilmedi.");
+                    }
+                }
+                println!("==================================================");
+                self.f9_was_down = true;
+            }
+        } else {
+            self.f9_was_down = false;
+        }
+
+        // F11 veya Insert: HUD Gösterge Paneli Hide/Show Toggle
+        if f11 || insert {
+            if !self.f11_was_down && !self.insert_was_down {
+                let visible = self.mode_controller.toggle_hud();
+                println!(
+                    ">>> [HUD GÖSTERGE PANELİ]: {}",
+                    if visible { "GÖRÜNÜR" } else { "GİZLİ" }
+                );
+                self.f11_was_down = true;
+                self.insert_was_down = true;
+            }
+        } else {
+            self.f11_was_down = false;
+            self.insert_was_down = false;
+        }
     }
 }
 
 /// Model A Çift-Thread Uygulama Yöneticisi
 pub struct App {
     pub config: GameConfig,
-    pub kit: Arc<SysMemKit>,
+    pub memory: Arc<MemoryRouter>,
     pub clientdll: usize,
     pub sound_tx: Sender<SoundEvent>,
     pub sound_esp_enabled: Arc<AtomicBool>,
@@ -247,32 +343,38 @@ pub struct App {
     pub running: Arc<AtomicBool>,
     pub settings: Arc<RwLock<VisualSettings>>,
     pub snapshot: Arc<RwLock<EspSnapshot>>,
+    pub mode_controller: ModeController,
 }
 
 impl App {
     pub fn new(
         config: GameConfig,
-        kit: Arc<SysMemKit>,
+        memory: Arc<MemoryRouter>,
         clientdll: usize,
         sound_tx: Sender<SoundEvent>,
+        mode_controller: ModeController,
     ) -> Self {
-        let initial_settings = VisualSettings::default_for_mode(kit.mode());
+        let initial_settings = VisualSettings::default_for_mode(memory.mode());
         println!(
             "[+] App oluşturuldu. Mod: {:?} (Minimal ESP: {})",
-            kit.mode(),
+            memory.mode(),
             initial_settings.is_minimal
         );
 
+        let sound_initial = config.options.soundESPEnabled;
+        let visual_initial = config.options.glowESPEnabled;
+
         Self {
             config,
-            kit,
+            memory,
             clientdll,
             sound_tx,
-            sound_esp_enabled: Arc::new(AtomicBool::new(false)),
-            visual_esp_enabled: Arc::new(AtomicBool::new(true)),
+            sound_esp_enabled: Arc::new(AtomicBool::new(sound_initial)),
+            visual_esp_enabled: Arc::new(AtomicBool::new(visual_initial)),
             running: Arc::new(AtomicBool::new(true)),
             settings: Arc::new(RwLock::new(initial_settings)),
             snapshot: Arc::new(RwLock::new(EspSnapshot::default())),
+            mode_controller,
         }
     }
 
@@ -280,7 +382,7 @@ impl App {
     /// - Arka Plan Thread: CS2 bellek okuma + Sound ESP + Anlık durum güncelleme
     /// - Ana Thread: DirectX 11 / ImGui Overlay döngüsü (mesafeye göre küçülen dinamik 2D box + mod duyarlı çizimler)
     pub fn run(self) {
-        let kit = Arc::clone(&self.kit);
+        let memory = Arc::clone(&self.memory);
         let config = self.config.clone();
         let clientdll = self.clientdll;
         let sound_tx = self.sound_tx.clone();
@@ -290,10 +392,10 @@ impl App {
 
         // 1. Arka plan bellek okuma thread'ini başlat
         let reader_thread = thread::Builder::new()
-            .name("cs2ru-memory-reader".into())
+            .name(obfstr::obfstr!("worker-mem").into())
             .spawn(move || {
                 Self::memory_reader_loop(
-                    kit,
+                    memory,
                     config,
                     clientdll,
                     sound_tx,
@@ -309,13 +411,15 @@ impl App {
             Arc::clone(&self.snapshot),
             Arc::clone(&self.settings),
             Arc::clone(&self.visual_esp_enabled),
+            Arc::clone(&self.sound_esp_enabled),
             Arc::clone(&self.running),
+            self.mode_controller.clone(),
         );
 
         // 2. Ana thread: Overlay başlatma prosedürü
-        let pid = self.kit.get_pid();
+        let pid = self.memory.get_pid();
         let options = OverlayOptions {
-            title: "CS2 Overlay".to_string(),
+            title: obfstr::obfstr!("AppHostOverlay").to_string(),
             target: OverlayTarget::WindowOfProcess(pid),
             register_fonts_callback: None,
         };
@@ -325,9 +429,25 @@ impl App {
             Arc::clone(&self.sound_esp_enabled),
             Arc::clone(&self.visual_esp_enabled),
             Arc::clone(&self.settings),
+            self.mode_controller.clone(),
+            Arc::clone(&self.memory),
         );
 
         let running = Arc::clone(&self.running);
+        let running_input = Arc::clone(&self.running);
+
+        // 1c. Bağımsız kısayol (hotkey) dinleyici thread'i (~100Hz):
+        // ImGui penceresi SW_HIDE ile gizli olsa veya WM_PAINT gelmese dahi
+        // F9, F11/Insert ve Shift+F1..F5 kısayollarının kesintisiz çalışmasını garanti eder.
+        let _input_thread = thread::Builder::new()
+            .name(obfstr::obfstr!("worker-inp").into())
+            .spawn(move || {
+                while running_input.load(Ordering::Relaxed) {
+                    input_handler.update();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+            .expect("Kısayol dinleyici thread'i başlatılamadı");
 
         match overlay::init(options) {
             Ok(system) => {
@@ -338,20 +458,42 @@ impl App {
                 println!("    Shift + F3: İskelet çizimi aç/kapat");
                 println!("    Shift + F4: İsim / HP / Silah detayları aç/kapat");
                 println!("    Shift + F5: Minimal / Detaylı çizim modu değiştir");
+                println!("    F9        : Stealth Mod değiştir (1 -> 2 -> 3 -> 4)");
+                println!("    F11 / INS : HUD gösterge panelini gizle/göster");
 
                 let snapshot_ref = Arc::clone(&self.snapshot);
                 let settings_ref = Arc::clone(&self.settings);
                 let visual_esp_ref = Arc::clone(&self.visual_esp_enabled);
+                let sound_esp_ref = Arc::clone(&self.sound_esp_enabled);
                 let running_ref = Arc::clone(&self.running);
+                let mode_controller_loop = self.mode_controller.clone();
+                let mode_controller_render = self.mode_controller.clone();
+                let mut last_imgui_visible = mode_controller_loop.is_imgui_active();
+
+                // Başlangıçta mod 3 veya 4 ise ImGui penceresini derhal gizleme bayrağı
+                let mut initial_checked = false;
 
                 // Overlay Winit ana döngüsü
                 system.main_loop(
-                    move |_controller| {
-                        input_handler.update();
+                    move |controller| {
+                        let should_be_visible = mode_controller_loop.is_imgui_active();
+                        if !initial_checked || should_be_visible != last_imgui_visible {
+                            controller.set_visible(should_be_visible);
+                            last_imgui_visible = should_be_visible;
+                            initial_checked = true;
+                            if should_be_visible {
+                                println!("[+] ImGui Overlay görünür (Mod: {:?})", mode_controller_loop.mode());
+                            } else {
+                                println!("[+] ImGui Overlay tamamen gizlendi (SW_HIDE) - AC Stealth devrede");
+                            }
+                        }
+
                         running_ref.load(Ordering::Relaxed)
                     },
                     move |ui, _unicode_renderer| {
-                        if !visual_esp_ref.load(Ordering::Relaxed) {
+                        // 1. Mod Kontrolü: Mod 3 (Indirect) veya Mod 4 (Rage) modlarında
+                        // ImGui KESİNLİKLE hiçbir çizim yapmaz (zero-draw).
+                        if !mode_controller_render.is_imgui_active() {
                             return true;
                         }
 
@@ -360,10 +502,32 @@ impl App {
                             Err(_) => return true,
                         };
 
+                        // 2. In-Game Kontrolü: Maçta değilken çizim yapma
+                        if !snapshot.is_in_game {
+                            return true;
+                        }
+
                         let settings = match settings_ref.read() {
                             Ok(set) => set.clone(),
                             Err(_) => return true,
                         };
+
+                        // 3. HUD Gösterge Paneli (mod seviyesi + özellik ON/OFF).
+                        // Visual ESP kapalı olsa da panel görünür kalır; yalnızca
+                        // Mod 1/2'de (ImGui aktif) ve HUD açıkken çizilir.
+                        if let Some(hud_model) = hud::build(
+                            &mode_controller_render,
+                            &settings,
+                            visual_esp_ref.load(Ordering::Relaxed),
+                            sound_esp_ref.load(Ordering::Relaxed),
+                        ) {
+                            Self::render_hud(ui, &hud_model);
+                        }
+
+                        // 4. ESP çizimi (visual ESP kapalıysa atla).
+                        if !visual_esp_ref.load(Ordering::Relaxed) {
+                            return true;
+                        }
 
                         Self::render_esp(ui, &snapshot, &settings);
                         true
@@ -378,7 +542,6 @@ impl App {
                 println!("[*] Çıkmak için Ctrl+C tuşlayabilirsiniz.");
 
                 while running.load(Ordering::Relaxed) {
-                    input_handler.update();
                     thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -390,7 +553,7 @@ impl App {
 
     /// Arka plan bellek okuma döngüsü (~100Hz)
     fn memory_reader_loop(
-        kit: Arc<SysMemKit>,
+        memory: Arc<MemoryRouter>,
         config: GameConfig,
         clientdll: usize,
         sound_tx: Sender<SoundEvent>,
@@ -401,35 +564,86 @@ impl App {
         println!("[+] Arka plan bellek okuyucu thread'i devrede.");
 
         let target_interval = Duration::from_millis(10); // ~100Hz
+        let initial_kit = memory.kit();
+        let mut player_cache: Vec<Player> = (0..64)
+            .map(|i| Player::new(i, 0, Arc::clone(&initial_kit), &config.offsets, clientdll))
+            .collect();
 
         while running.load(Ordering::Relaxed) {
             let start = Instant::now();
+
+            // Mod geçişi bu turun ortasında olsa bile okumalar tek bir tutarlı
+            // syscall katmanı üzerinden yapılır.
+            let kit = memory.kit();
 
             let entitylist: usize = unsafe { kit.read(clientdll + config.offsets.entityList as usize) };
             if entitylist != 0 {
                 let list_entry: usize = unsafe { kit.read(entitylist + 0x10) };
                 if list_entry != 0 {
+                    for p in player_cache.iter_mut() {
+                        p.reset_context(entitylist, list_entry, Arc::clone(&kit));
+                    }
+
                     // 1. ViewMatrix oku
                     let view_matrix_bytes = unsafe {
                         kit.read_buffer(clientdll + config.offsets.viewMatrix as usize, 64)
                     };
                     let view_matrix = ViewMatrix::from_bytes(&view_matrix_bytes);
 
-                    // 2. Local player bul
+                    // 2. Local player'ı doğrudan offset üzerinden çöz (64 slot taramadan)
                     let mut local_player_info: Option<(Vec3, i32)> = None;
-                    for i in 0..64 {
-                        let mut p = Player::new(i, list_entry, &kit, &config.offsets, clientdll);
-                        if p.update(true) && p.localplayer {
-                            local_player_info = Some((p.pos, p.team));
-                            break;
+                    if config.offsets.localPlayerController != 0 {
+                        let local_ctrl: usize = unsafe {
+                            kit.read(clientdll + config.offsets.localPlayerController as usize)
+                        };
+                        if local_ctrl != 0 {
+                            let pawn_handle: usize = unsafe {
+                                kit.read(local_ctrl + config.offsets.controller.m_hPawn)
+                            };
+                            if pawn_handle != 0 && (pawn_handle & 0x7FFF) != 0x7FFF {
+                                let pawn_entry: usize = unsafe {
+                                    kit.read(entitylist + 0x10 + 0x8 * ((pawn_handle & 0x7FFF) >> 9))
+                                };
+                                if pawn_entry != 0 {
+                                    let local_pawn: usize = unsafe {
+                                        kit.read(pawn_entry + 0x70 * (pawn_handle & 0x1FF))
+                                    };
+                                    if local_pawn != 0 {
+                                        let team: i32 = unsafe {
+                                            kit.read(local_pawn + config.offsets.pawn.m_iTeamNum)
+                                        };
+                                        let pos_buf = unsafe {
+                                            kit.read_buffer(
+                                                local_pawn + config.offsets.pawn.m_vOldOrigin,
+                                                12,
+                                            )
+                                        };
+                                        if pos_buf.len() == 12 {
+                                            let px = f32::from_le_bytes(
+                                                pos_buf[0..4].try_into().unwrap_or([0; 4]),
+                                            );
+                                            let py = f32::from_le_bytes(
+                                                pos_buf[4..8].try_into().unwrap_or([0; 4]),
+                                            );
+                                            let pz = f32::from_le_bytes(
+                                                pos_buf[8..12].try_into().unwrap_or([0; 4]),
+                                            );
+                                            local_player_info = Some((Vec3::new(px, py, pz), team));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    let forward = [
-                        view_matrix.matrix[0][2],
-                        view_matrix.matrix[1][2],
-                        view_matrix.matrix[2][2],
-                    ];
+                    // 3. Tüm oyuncuları kalıcı önbellek üzerinden güncelle
+                    for p in player_cache.iter_mut() {
+                        if p.update(false) && p.localplayer && local_player_info.is_none() {
+                            local_player_info = Some((p.pos, p.team));
+                        }
+                    }
+
+                    let forward = view_matrix.forward_vector();
 
                     let mut player_snapshots = Vec::new();
                     let mut closest_enemies: Vec<(f32, f32, f32)> = Vec::new();
@@ -439,10 +653,8 @@ impl App {
                         None => (false, Vec3::default(), 0),
                     };
 
-                    // 3. Diğer oyuncuları tara
-                    for i in 0..64 {
-                        let mut p = Player::new(i, list_entry, &kit, &config.offsets, clientdll);
-                        if !p.update(false) || !p.alive || p.localplayer {
+                    for p in player_cache.iter() {
+                        if !p.alive || p.localplayer {
                             continue;
                         }
 
@@ -455,7 +667,7 @@ impl App {
                                 [p.pos.x, p.pos.y, p.pos.z],
                                 forward,
                             );
-                            if dist < 2000.0 {
+                            if dist.is_finite() && dist < 2000.0 {
                                 closest_enemies.push((dist, l, r));
                             }
                         }
@@ -472,29 +684,107 @@ impl App {
                             head_pos,
                             bone_list: p.bone_list.clone(),
                             health: p.health,
+                            armor: p.armor,
                             team: p.team,
                             name: p.name.clone(),
                             weapon: p.clean_weapon.clone(),
+                            scoped: p.scoped,
+                            defusing: p.defusing,
+                            flashed: p.flashed,
                         });
                     }
 
-                    // 4. Sound ESP olayı gönder
+                    // 4. Sound ESP olayı gönder (en yakın düşman)
                     if sound_esp_enabled.load(Ordering::Relaxed) && !closest_enemies.is_empty() {
-                        closest_enemies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                        for (_, l, r) in closest_enemies.iter().take(3) {
-                            let _ = sound_tx.send(SoundEvent {
-                                left: *l,
-                                right: *r,
-                            });
+                        closest_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        if let Some(&(_, l, r)) = closest_enemies.first() {
+                            let _ = sound_tx.send(SoundEvent { left: l, right: r });
                         }
                     }
 
-                    // 5. Snapshot güncelle
+                    // 5. Kurulu C4 Kontrolü
+                    let mut planted_c4: Option<PlantedC4Snapshot> = None;
+                    if config.offsets.plantedC4 != 0 {
+                        let c4_ptr_addr = clientdll + config.offsets.plantedC4 as usize;
+                        let is_planted_flag: bool = unsafe {
+                            kit.read(c4_ptr_addr.saturating_sub(config.offsets.bomb.m_isPlanted))
+                        };
+                        let c4_list_ptr: usize = unsafe { kit.read(c4_ptr_addr) };
+                        if c4_list_ptr != 0 {
+                            let c4_entity: usize = unsafe { kit.read(c4_list_ptr) };
+                            if c4_entity != 0 {
+                                let activated: bool = unsafe {
+                                    kit.read(c4_entity + config.offsets.bomb.m_bC4Activated)
+                                };
+                                if activated || is_planted_flag {
+                                    let site: i32 = unsafe {
+                                        kit.read(c4_entity + config.offsets.bomb.m_nBombSite)
+                                    };
+                                    let scene_node: usize = unsafe {
+                                        kit.read(c4_entity + config.offsets.pawn.m_pGameSceneNode)
+                                    };
+                                    if scene_node != 0 {
+                                        let pos_buf = unsafe {
+                                            kit.read_buffer(
+                                                scene_node + config.offsets.bomb.m_vecAbsOrigin,
+                                                12,
+                                            )
+                                        };
+                                        if pos_buf.len() == 12 {
+                                            let bx = f32::from_le_bytes(
+                                                pos_buf[0..4].try_into().unwrap_or([0; 4]),
+                                            );
+                                            let by = f32::from_le_bytes(
+                                                pos_buf[4..8].try_into().unwrap_or([0; 4]),
+                                            );
+                                            let bz = f32::from_le_bytes(
+                                                pos_buf[8..12].try_into().unwrap_or([0; 4]),
+                                            );
+                                            planted_c4 = Some(PlantedC4Snapshot {
+                                                pos: Vec3::new(bx, by, bz),
+                                                site,
+                                                is_planted: true,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 6. In-Game ve Harita Kontrolü
+                    let mut map_name = String::new();
+                    let global_vars_ptr: usize = unsafe { kit.read(clientdll + config.offsets.globalVars as usize) };
+                    if global_vars_ptr != 0 {
+                        let map_name_addr = global_vars_ptr + config.offsets.global_vars.currentMapName;
+                        let map_ptr: usize = unsafe { kit.read(map_name_addr) };
+                        let target_addr = if map_ptr > 0x10000 && map_ptr < 0x7FFFFFFFFFFF {
+                            map_ptr
+                        } else {
+                            map_name_addr
+                        };
+                        let buf = unsafe { kit.read_buffer(target_addr, 64) };
+                        if let Some(pos) = buf.iter().position(|&b| b == 0) {
+                            if let Ok(s) = std::str::from_utf8(&buf[..pos]) {
+                                map_name = s.trim().to_string();
+                            }
+                        }
+                    }
+
+                    let map_is_valid = !map_name.is_empty()
+                        && !map_name.contains(obfstr::obfstr!("<empty>"))
+                        && crate::hash::rt_hash(&map_name) != crate::kh!("unknown");
+                    let is_in_game = map_is_valid && has_local && local_team != 0;
+
+                    // 7. Snapshot güncelle
                     if let Ok(mut snap) = snapshot_shared.write() {
                         snap.view_matrix = view_matrix;
                         snap.local_team = local_team;
                         snap.has_local = has_local;
-                        snap.players = player_snapshots;
+                        snap.is_in_game = is_in_game;
+                        snap.map_name = map_name;
+                        snap.players = if is_in_game { player_snapshots } else { Vec::new() };
+                        snap.planted_c4 = if is_in_game { planted_c4 } else { None };
                     }
                 }
             }
@@ -508,226 +798,93 @@ impl App {
         println!("[*] Arka plan bellek okuyucu thread'i sonlandı.");
     }
 
-    /// ImGui DrawList üzerinden ESP çizimlerini gerçekleştirir.
-    /// - Mesafeye göre dinamik küçülen 2D bounding box
-    /// - Mode / minimal ayarına göre şekillenen çizimler (Rage: minimal, Legit: detaylı)
+    /// HUD gösterge panelini ImGui DrawList üzerinden çizer (yalnızca Mod 1/2).
+    ///
+    /// İçerik `crate::hud::build` tarafından üretilir; Discord canvas overlay'i
+    /// aynı modeli kullandığı için iki yol arasında bilgi farkı oluşmaz.
+    fn render_hud(ui: &imgui::Ui, model: &hud::HudModel) {
+        let draw_list = ui.get_background_draw_list();
+
+        let x0 = hud::ORIGIN[0];
+        let y0 = hud::ORIGIN[1];
+        let pad = hud::PADDING;
+        let row_h = hud::ROW_HEIGHT;
+        let x1 = x0 + hud::PANEL_WIDTH;
+        let y1 = y0 + model.height();
+        let text_x = x0 + pad + 4.0;
+
+        // Panel zemini, kenarlık ve sol aksan çizgisi
+        draw_list
+            .add_rect([x0, y0], [x1, y1], col(11, 13, 17, 210))
+            .filled(true)
+            .rounding(4.0)
+            .build();
+        draw_list
+            .add_rect([x0, y0], [x1, y1], col(70, 80, 95, 160))
+            .rounding(4.0)
+            .build();
+        draw_list
+            .add_rect([x0, y0 + 4.0], [x0 + 3.0, y1 - 4.0], col(65, 160, 255, 255))
+            .filled(true)
+            .build();
+
+        let mut y = y0 + pad;
+        draw_list.add_text([text_x, y], col(65, 160, 255, 255), &model.header);
+        y += row_h;
+
+        for row in &model.rows {
+            draw_list.add_text([text_x, y], col(150, 158, 170, 255), row.label);
+            let value_color = if row.on {
+                col(90, 220, 120, 255)
+            } else {
+                col(230, 90, 90, 255)
+            };
+            let value_w = ui.calc_text_size(&row.detail)[0];
+            draw_list.add_text([x1 - pad - value_w, y], value_color, &row.detail);
+            y += row_h;
+        }
+
+        y += 3.0;
+        draw_list.add_text([text_x, y], col(105, 112, 124, 255), model.footer);
+    }
+
+    /// Ortak `crate::esp::build_esp_draw_list` çıktısını ImGui DrawList üzerinden çizer.
     fn render_esp(ui: &imgui::Ui, snapshot: &EspSnapshot, settings: &VisualSettings) {
         let draw_list = ui.get_background_draw_list();
         let [display_w, display_h] = ui.io().display_size;
 
-        if display_w <= 0.0 || display_h <= 0.0 {
-            return;
+        let cmds = esp::build_esp_draw_list(snapshot, settings, display_w, display_h);
+
+        for f in &cmds.filled_rects {
+            draw_list
+                .add_rect([f.x, f.y], [f.x + f.w, f.y + f.h], f.color.to_f32_array())
+                .filled(true)
+                .build();
         }
 
-        let is_minimal = settings.is_minimal;
+        for l in &cmds.lines {
+            draw_list
+                .add_line([l.x1, l.y1], [l.x2, l.y2], l.color.to_f32_array())
+                .thickness(l.thickness)
+                .build();
+        }
 
-        for player in &snapshot.players {
-            if player.health <= 0 {
-                continue;
-            }
+        for c in &cmds.circles {
+            draw_list
+                .add_circle([c.cx, c.cy], c.radius, c.color.to_f32_array())
+                .thickness(c.thickness)
+                .build();
+        }
 
-            let is_enemy = snapshot.local_team != 0 && player.team != snapshot.local_team;
-            let base_color = if is_enemy {
-                col(255, 65, 65, 255) // Düşman: Kırmızı
-            } else {
-                col(65, 160, 255, 255) // Takım arkadaşı: Mavi
-            };
+        for r in &cmds.rects {
+            draw_list
+                .add_rect([r.x, r.y], [r.x + r.w, r.y + r.h], r.color.to_f32_array())
+                .thickness(r.thickness)
+                .build();
+        }
 
-            // Kafa üstü sınır (kafa kemiğinin 8 birim yukarısı)
-            let head_top = player.head_pos + Vec3::new(0.0, 0.0, 8.0);
-
-            // 1. Ekran izdüşüm koordinatlarını hesapla (World-to-Screen)
-            let feet_proj =
-                snapshot.view_matrix.world_to_screen(&player.pos, display_w, display_h);
-            let head_proj =
-                snapshot.view_matrix.world_to_screen(&head_top, display_w, display_h);
-
-            let (fx, fy) = match feet_proj {
-                Some(p) => p,
-                None => continue,
-            };
-            let (_hx, hy) = match head_proj {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // 2. Dinamik 2D Bounding Box:
-            // Karakter uzaklaştıkça W2S perspektif bölmesi büyür,
-            // dolayısıyla ekrandaki dikey piksel boyutu (fy - hy).abs() doğal olarak küçülür.
-            let box_height = (fy - hy).abs();
-            if box_height < 4.0 || box_height > display_h * 2.5 {
-                continue;
-            }
-
-            let box_width = box_height * 0.45;
-            let center_x = fx;
-            let min_x = center_x - box_width / 2.0;
-            let max_x = center_x + box_width / 2.0;
-            let min_y = hy.min(fy);
-            let max_y = hy.max(fy);
-
-            // 3. Mod Duyarlı Çizim Mantığı
-            if is_minimal {
-                // RAGE / MINIMAL MOD: Sadece sade 2D kutu çizilir (dikkat dağıtıcı öğeler yok)
-                if settings.show_box {
-                    draw_list
-                        .add_rect([min_x, min_y], [max_x, max_y], base_color)
-                        .thickness(1.0)
-                        .build();
-                }
-            } else {
-                // LEGIT / DETAYLI MOD: Kutu + HP Barı + İsim + Silah + İskelet
-
-                // A) Sınırlayıcı Kutu (Kontrastlı dış ve iç siyah kenarlık)
-                if settings.show_box {
-                    draw_list
-                        .add_rect(
-                            [min_x - 1.0, min_y - 1.0],
-                            [max_x + 1.0, max_y + 1.0],
-                            col(0, 0, 0, 255),
-                        )
-                        .thickness(1.0)
-                        .build();
-                    draw_list
-                        .add_rect([min_x, min_y], [max_x, max_y], base_color)
-                        .thickness(1.0)
-                        .build();
-                    draw_list
-                        .add_rect(
-                            [min_x + 1.0, min_y + 1.0],
-                            [max_x - 1.0, max_y - 1.0],
-                            col(0, 0, 0, 255),
-                        )
-                        .thickness(1.0)
-                        .build();
-                }
-
-                // B) Can Barı (Sol kenarda dikey çubuk)
-                if settings.show_health {
-                    let bar_w = (box_width * 0.08).clamp(2.0, 4.0);
-                    let bar_x = min_x - 4.0 - bar_w;
-                    let bar_h = box_height;
-
-                    // Arka plan (Siyah gölge)
-                    draw_list
-                        .add_rect(
-                            [bar_x - 1.0, min_y - 1.0],
-                            [bar_x + bar_w + 1.0, max_y + 1.0],
-                            col(0, 0, 0, 220),
-                        )
-                        .filled(true)
-                        .build();
-
-                    // Sağlık yüzdesi ve rengi
-                    let hp_pct = (player.health.clamp(0, 100) as f32) / 100.0;
-                    let hp_h = bar_h * hp_pct;
-                    let hp_top_y = max_y - hp_h;
-
-                    let hp_color = if player.health > 60 {
-                        col(50, 220, 50, 255) // Yeşil
-                    } else if player.health > 25 {
-                        col(240, 180, 20, 255) // Turuncu/Sarı
-                    } else {
-                        col(240, 40, 40, 255) // Kırmızı
-                    };
-
-                    draw_list
-                        .add_rect([bar_x, hp_top_y], [bar_x + bar_w, max_y], hp_color)
-                        .filled(true)
-                        .build();
-
-                    // HP 100'den az ise sayısal değeri yaz
-                    if player.health < 100 && player.health > 0 {
-                        let hp_text = format!("{}", player.health);
-                        draw_list.add_text(
-                            [bar_x - 16.0, hp_top_y - 2.0],
-                            col(255, 255, 255, 255),
-                            &hp_text,
-                        );
-                    }
-                }
-
-                // C) Oyuncu İsmi (Kutunun üstünde)
-                if settings.show_name && !player.name.is_empty() {
-                    draw_list.add_text(
-                        [min_x, min_y - 14.0],
-                        col(255, 255, 255, 255),
-                        &player.name,
-                    );
-                }
-
-                // D) Silah İsmi (Kutunun altında)
-                if settings.show_weapon && !player.weapon.is_empty() {
-                    draw_list.add_text(
-                        [min_x, max_y + 2.0],
-                        col(210, 210, 210, 255),
-                        &player.weapon,
-                    );
-                }
-
-                // E) İskelet / Kemik Hatları (Skeleton)
-                if settings.show_skeleton && player.bone_list.len() >= 28 {
-                    let skeleton_color = col(255, 255, 255, 200);
-                    let bone_pairs: &[(usize, usize)] = &[
-                        // Baş - Boyun - Omurga - Pelvis
-                        (6, 5),
-                        (5, 4),
-                        (4, 2),
-                        (2, 0),
-                        // Sol Kol
-                        (5, 8),
-                        (8, 9),
-                        (9, 10),
-                        // Sağ Kol
-                        (5, 13),
-                        (13, 14),
-                        (14, 15),
-                        // Sol Bacak
-                        (0, 22),
-                        (22, 23),
-                        (23, 24),
-                        // Sağ Bacak
-                        (0, 25),
-                        (25, 26),
-                        (26, 27),
-                    ];
-
-                    for &(b1, b2) in bone_pairs {
-                        if b1 < player.bone_list.len() && b2 < player.bone_list.len() {
-                            let p1 = snapshot.view_matrix.world_to_screen(
-                                &player.bone_list[b1],
-                                display_w,
-                                display_h,
-                            );
-                            let p2 = snapshot.view_matrix.world_to_screen(
-                                &player.bone_list[b2],
-                                display_w,
-                                display_h,
-                            );
-
-                            if let (Some(pt1), Some(pt2)) = (p1, p2) {
-                                draw_list
-                                    .add_line([pt1.0, pt1.1], [pt2.0, pt2.1], skeleton_color)
-                                    .thickness(1.2)
-                                    .build();
-                            }
-                        }
-                    }
-
-                    // Kafa dairesi
-                    if let Some(head_pt) = snapshot.view_matrix.world_to_screen(
-                        &player.bone_list[6],
-                        display_w,
-                        display_h,
-                    ) {
-                        let radius = (box_height * 0.07).clamp(2.5, 7.0);
-                        draw_list
-                            .add_circle([head_pt.0, head_pt.1], radius, skeleton_color)
-                            .thickness(1.2)
-                            .build();
-                    }
-                }
-            }
+        for t in &cmds.texts {
+            draw_list.add_text([t.x, t.y], t.color.to_f32_array(), &t.text);
         }
     }
 }

@@ -159,7 +159,7 @@ impl FontAtlasBuilder {
         self.register_codepoints(value.chars().map(|c| c as u32));
     }
 
-    pub fn build_font_source(&self, size_pixels: f32) -> (Vec<FontSource>, GlyphRangeMemoryGuard) {
+    pub fn build_font_source(&self, size_pixels: f32) -> (Vec<FontSource<'_>>, GlyphRangeMemoryGuard) {
         let mut font_sources = Vec::with_capacity(self.fonts.len());
         let mut glyph_range_buffers: Vec<Vec<u32>> = Vec::with_capacity(self.fonts.len());
 

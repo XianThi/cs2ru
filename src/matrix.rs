@@ -54,4 +54,15 @@ impl ViewMatrix {
 
         Some((screen_x, screen_y))
     }
+
+    /// Kamera bakış (forward) birim vektörünü döndürür (3D ses pan/yön hesabı için).
+    pub fn forward_vector(&self) -> [f32; 3] {
+        let f = [self.matrix[3][0], self.matrix[3][1], self.matrix[3][2]];
+        let len = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+        if len > 1e-4 {
+            [f[0] / len, f[1] / len, f[2] / len]
+        } else {
+            [1.0, 0.0, 0.0]
+        }
+    }
 }

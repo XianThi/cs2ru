@@ -1,6 +1,12 @@
+#[macro_use]
+pub mod hash;
 mod app;
 mod discord_overlay;
+pub mod esp;
+mod hud;
 mod matrix;
+mod memory;
+pub mod mode;
 mod offset;
 mod player;
 mod sound;
@@ -8,8 +14,10 @@ mod utils;
 mod vec3;
 
 use crate::app::App;
+use crate::memory::MemoryRouter;
+use crate::mode::{ModeController, StealthMode};
 use crate::offset::GameConfig;
-use crate::player::Player;
+use obfstr::obfstr;
 use std::io::{self, Write};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -60,7 +68,7 @@ fn select_mode() -> Mode {
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--discord-selftest") {
+    if std::env::args().any(|a| crate::hash::rt_hash(&a) == kh!("--discord-selftest")) {
         discord_overlay::selftest();
         return;
     }
@@ -69,42 +77,60 @@ fn main() {
 
     println!("[*] Oyun tespiti için bekleniyor...");
     sleep(Duration::from_secs(2)); // Oyun ve hedef sürecin hazır olması için bekle
-    let mut config = GameConfig::load("offsets.toml").unwrap_or_else(|_| {
-        println!("[!] offsets.toml bulunamadı, varsayılan yapılandırma oluşturuluyor...");
+    let cfg_path = obfstr!("offsets.toml").to_string();
+    let mut config = GameConfig::load(&cfg_path).unwrap_or_else(|_| {
+        println!("[!] Yapılandırma dosyası bulunamadı, varsayılan yapılandırma oluşturuluyor...");
         GameConfig::default()
     });
 
-    println!("[*] Güncel offsetler GitHub üzerinden çekiliyor (a2x/cs2-dumper)...");
-    match config.update_from_web() {
+    println!("[*] Güncel offsetler çekiliyor...");
+    let web_updated = match config.update_from_web() {
         Ok(_) => {
             println!("[+] Offsetler internetten başarıyla güncellendi!");
-            if let Err(e) = config.save("offsets.toml") {
-                eprintln!("[!] Güncellenen offsetler offsets.toml dosyasına kaydedilemedi: {}", e);
+            if let Err(e) = config.save(&cfg_path) {
+                eprintln!("[!] Güncellenen offsetler kaydedilemedi: {}", e);
             } else {
-                println!("[+] Güncel offsetler offsets.toml dosyasına kaydedildi.");
+                println!("[+] Güncel offsetler kaydedildi.");
             }
+            true
         }
         Err(e) => {
-            eprintln!("[!] İnternetten offset çekilemedi: {}. Mevcut yerel offsetler kullanılacak.", e);
+            eprintln!("[!] İnternetten offset çekilemedi: {}. Signature taraması / yerel offsetler kullanılacak.", e);
+            false
         }
-    }
+    };
 
     unsafe {
-        let kit: SysMemKit = SysMemKit::with_mode("cs2.exe", false, mode)
-            .expect("Oyun bulunamadı veya handle çalınamadı!");
+        // Hedef süreç ve modül isimleri derleme zamanında DJB2 hash'e dönüştürülür;
+        // "cs2.exe", "client.dll", "engine2.dll" ikili dosyada (.rdata) yer almaz.
+        const TARGET_PROC_HASH: u32 = djb2!("cs2.exe");
+        const CLIENT_MOD_HASH: u32 = djb2!("client.dll");
+        const ENGINE_MOD_HASH: u32 = djb2!("engine2.dll");
+
+        let kit: SysMemKit = match SysMemKit::with_mode_hash(TARGET_PROC_HASH, mode) {
+            Some(kit) => kit,
+            None if mode == Mode::Rage => {
+                eprintln!("[!] Rage (ROP) katmanı kurulamadı; Indirect katmanına düşülüyor.");
+                SysMemKit::with_mode_hash(TARGET_PROC_HASH, Mode::Indirect).unwrap_or_else(|| {
+                    panic!("Oyun bulunamadı, handle çalınamadı veya syscall katmanı kurulamadı!")
+                })
+            }
+            None => panic!("Oyun bulunamadı, handle çalınamadı veya syscall katmanı kurulamadı!"),
+        };
+
         println!(
             "[+] SysMemKit başarıyla bağlandı! PID: {}, Mod: {:?}",
             kit.get_pid(),
             kit.mode()
         );
 
-        let clientdll = match kit.getmodule("client.dll") {
+        let clientdll = match kit.getmodule_hash(CLIENT_MOD_HASH) {
             Some(dll) => {
-                println!("[+] client.dll bulundu: 0x{:016X}", dll);
+                println!("[+] Modül #1 bulundu: 0x{:016X}", dll);
                 dll
             }
             None => {
-                println!("[!] client.dll bulunamadı! Yüklü modüller listeleniyor:");
+                println!("[!] Modül #1 bulunamadı! Yüklü modüller listeleniyor:");
                 for (name, base) in kit.list_modules() {
                     println!("  - 0x{:016X}: {}", base, name);
                 }
@@ -112,104 +138,41 @@ fn main() {
             }
         };
 
-        let _engine2dll = match kit.getmodule("engine2.dll") {
+        let engine2dll = match kit.getmodule_hash(ENGINE_MOD_HASH) {
             Some(dll) => {
-                println!("[+] engine2.dll bulundu: 0x{:016X}", dll);
+                println!("[+] Modül #2 bulundu: 0x{:016X}", dll);
                 dll
             }
             None => {
-                println!("[!] engine2.dll bulunamadı! Yüklü modüller listeleniyor:");
+                println!("[!] Modül #2 bulunamadı! Yüklü modüller listeleniyor:");
                 for (name, base) in kit.list_modules() {
                     println!("  - 0x{:016X}: {}", base, name);
                 }
                 return;
             }
         };
+
+        if !web_updated {
+            let count = config.update_from_signatures(&kit, clientdll, engine2dll);
+            if count > 0 {
+                println!("[+] Signature taraması ile {} ana tablo offseti bellekten güncellendi.", count);
+                let _ = config.save(&cfg_path);
+            }
+        }
 
         let (tx, rx) = channel();
         thread::spawn(move || sound::StereoSine::audio_thread(rx));
 
-        let app = App::new(config, Arc::new(kit), clientdll, tx);
+        let stealth_mode = StealthMode::from_sys_mode(kit.mode());
+        let mode_controller = ModeController::new(stealth_mode);
+
+        let app = App::new(
+            config,
+            Arc::new(MemoryRouter::new(kit)),
+            clientdll,
+            tx,
+            mode_controller,
+        );
         app.run();
     }
-}
-
-#[allow(dead_code)]
-fn fnv1a_hash(data: u32) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xCBF29CE484222325;
-    const FNV_PRIME: u64 = 0x100000001B3;
-
-    let bytes = data.to_le_bytes();
-    let mut hash = FNV_OFFSET_BASIS;
-    for b in bytes {
-        hash = hash ^ (b as u64);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-#[allow(dead_code)]
-fn analyze_shared_memory(kit: &SysMemKit, magic_addr: usize) {
-    unsafe {
-        let magic = kit.read::<u32>(magic_addr);
-        println!("Magic: 0x{:X}", magic);
-
-        let frame_count = kit.read::<u32>(magic_addr + 4);
-        println!("Frame count: {}", frame_count);
-
-        let width = kit.read::<u32>(magic_addr + 12);
-        println!("Width: {}", width);
-
-        let height = kit.read::<u32>(magic_addr + 16);
-        println!("Height: {}", height);
-
-        let framebuffer_ptr = kit.read::<usize>(magic_addr + 20);
-        println!("Framebuffer pointer: 0x{:X}", framebuffer_ptr);
-
-        if framebuffer_ptr != 0 {
-            let first_pixel = kit.read::<u32>(framebuffer_ptr);
-            println!("First pixel (BGRA): 0x{:08X}", first_pixel);
-        }
-
-        let overlay_info_addr = magic_addr - 32;
-        println!("\nTrying to find OverlayInfo at 0x{:X}", overlay_info_addr);
-
-        let message_window = kit.read::<usize>(overlay_info_addr);
-        let overlay_window = kit.read::<usize>(overlay_info_addr + 8);
-        println!("Message window handle: 0x{:X}", message_window);
-        println!("Overlay window handle: 0x{:X}", overlay_window);
-
-        for offset in -0x1000..0x1000 {
-            let addr = (magic_addr as isize + offset) as usize;
-            if addr < magic_addr - 0x2000 {
-                continue;
-            }
-
-            let hash = kit.read::<u64>(addr);
-            let ptr = kit.read::<usize>(addr + 8);
-
-            if hash > 0x1000000 && ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF {
-                println!(
-                    "Possible hash entry at 0x{:X}: hash=0x{:X}, ptr=0x{:X}",
-                    addr, hash, ptr
-                );
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn find_local_player<'a>(
-    kit: &'a SysMemKit,
-    config: &'a GameConfig,
-    list_entry: usize,
-    clientbase: usize,
-) -> Option<Player<'a>> {
-    for i in 0..64 {
-        let mut player = Player::new(i, list_entry, kit, &config.offsets, clientbase);
-        if player.update(true) && player.localplayer {
-            return Some(player);
-        }
-    }
-    None
 }

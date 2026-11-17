@@ -19,10 +19,17 @@ use std::thread;
 use std::time::Duration;
 
 use crate::app::{EspSnapshot, VisualSettings};
-use crate::vec3::Vec3;
+use crate::esp;
+use crate::hash::{json_get_by_hash, rt_hash};
+use crate::hud;
+use crate::mode::ModeController;
+use obfstr::obfstr;
 
-/// Ana Discord süreci `--remote-debugging-port=9222` ile başlatılmalı.
-const CDP_PORT: u16 = 9222;
+/// Ana Discord süreci `--remote-debugging-port=9222` ile başlatılmalı (sabit port derleme zamanında maskelenir).
+#[inline]
+fn cdp_port() -> u16 {
+    crate::obf_u16!(9222)
+}
 /// ESP gönderim hızı.
 const SEND_HZ: u64 = 60;
 
@@ -39,7 +46,7 @@ impl CdpSocket {
     /// `ws://127.0.0.1:<port>/devtools/page/<id>` adresine bağlanır.
     fn connect(ws_url: &str) -> Result<Self, String> {
         let rest = ws_url
-            .strip_prefix("ws://")
+            .strip_prefix(obfstr!("ws://"))
             .ok_or_else(|| format!("desteklenmeyen ws url: {ws_url}"))?;
         let (hostport, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -63,13 +70,11 @@ impl CdpSocket {
 
         let key = ws_key();
         let req = format!(
-            "GET {path} HTTP/1.1\r\n\
-             Host: {hostport}\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: {key}\r\n\
-             Sec-WebSocket-Version: 13\r\n\
-             User-Agent: cs2ru-overlay\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {hostport}\r\n{}: {key}\r\n{}",
+            obfstr!("Sec-WebSocket-Key"),
+            obfstr!(
+                "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+            )
         );
         stream
             .write_all(req.as_bytes())
@@ -185,9 +190,10 @@ impl CdpSocket {
         let id = self.next_id;
         self.next_id += 1;
 
+        let method_name = obfstr!("Runtime.evaluate").to_string();
         let msg = serde_json::json!({
             "id": id,
-            "method": "Runtime.evaluate",
+            "method": method_name,
             "params": {
                 "expression": js,
                 "returnByValue": true,
@@ -207,19 +213,20 @@ impl CdpSocket {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if v.get("id").and_then(|x| x.as_u64()) != Some(id) {
+            if json_get_by_hash(&v, crate::kh!("id")).and_then(|x| x.as_u64()) != Some(id) {
                 continue;
             }
-            if let Some(err) = v.get("error") {
+            if let Some(err) = json_get_by_hash(&v, crate::kh!("error")) {
                 return Err(format!("CDP hatası: {err}"));
             }
-            let result = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
-            if let Some(ex) = result.get("exceptionDetails") {
+            let result = json_get_by_hash(&v, crate::kh!("result"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(ex) = json_get_by_hash(&result, crate::kh!("exceptionDetails")) {
                 return Err(format!("JS hatası: {ex}"));
             }
-            return Ok(result
-                .get("result")
-                .and_then(|r| r.get("value"))
+            return Ok(json_get_by_hash(&result, crate::kh!("result"))
+                .and_then(|r| json_get_by_hash(r, crate::kh!("value")))
                 .map(|x| match x {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -299,9 +306,9 @@ fn base64(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// `http://127.0.0.1:9222/json/list` içinden Discord overlay sayfasının
-/// `webSocketDebuggerUrl` adresini seçer.
+/// `webSocketDebuggerUrl` adresini seçer (anahtarlar runtime hash ile çözülür).
 fn find_overlay_target(port: u16) -> Result<String, String> {
-    let url = format!("http://127.0.0.1:{port}/json/list");
+    let url = format!("{}{port}{}", obfstr!("http://127.0.0.1:"), obfstr!("/json/list"));
     let body = ureq::get(&url)
         .timeout(Duration::from_secs(2))
         .call()
@@ -315,94 +322,179 @@ fn find_overlay_target(port: u16) -> Result<String, String> {
 
     let mut fallback: Option<String> = None;
     for t in arr {
-        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if ty != "page" {
+        let ty = json_get_by_hash(t, crate::kh!("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if rt_hash(ty) != crate::kh!("page") {
             continue;
         }
-        let ws = match t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+        let ws = match json_get_by_hash(t, crate::kh!("webSocketDebuggerUrl")).and_then(|v| v.as_str()) {
             Some(w) => w.to_string(),
             None => continue,
         };
-        let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let turl = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if title.to_ascii_lowercase().contains("overlay") || turl.contains("popout") {
+        let title = json_get_by_hash(t, crate::kh!("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let turl = json_get_by_hash(t, crate::kh!("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if title.to_ascii_lowercase().contains(obfstr!("overlay")) || turl.contains(obfstr!("popout")) {
             return Ok(ws);
         }
         if fallback.is_none() {
             fallback = Some(ws);
         }
     }
-    fallback.ok_or_else(|| "CDP'de uygun 'page' target bulunamadı".to_string())
+    fallback.ok_or_else(|| "CDP'de uygun target bulunamadı".to_string())
 }
 
 // ---------------------------------------------------------------------------
-// Enjeksiyon betiği (canvas + rAF döngüsü)
+// Çalışma zamanı rastgele DOM / JS tanımlayıcı üreteci (sıfır sabit imza)
 // ---------------------------------------------------------------------------
 
-pub const INSTALL_JS: &str = r#"
-(function(){
-  var ID='__hermes_fb';
-  // Nesil sayacı: eski örnekler kendini imha eder, üst üste katman kalmaz.
-  window.__hermesGen=(window.__hermesGen||0)+1;
-  var GEN=window.__hermesGen;
-  if(window.__hermesStop){try{window.__hermesStop();}catch(e){}}
-  // Eski kopyaları DOM'dan silmek eski MutationObserver'ları tetikleyip sonsuz
-  // ping-pong'a yol açıyor; gizlemek yeterli ve güvenli.
-  document.querySelectorAll('#'+ID).forEach(function(n){try{n.style.display='none';n.style.visibility='hidden';}catch(e){}});
+#[derive(Debug, Clone)]
+pub struct SessionTokens {
+    pub canvas_id: String,
+    pub state_var: String,
+    pub gen_var: String,
+    pub fb_var: String,
+    pub stop_var: String,
+    pub fps_var: String,
+    pub frames_var: String,
+    pub err_var: String,
+}
+
+impl SessionTokens {
+    /// Her süreç çalışmasında benzersiz, sıradan görünümlü DOM ve `window`
+    /// tanımlayıcıları üretir (`__hermes_fb` veya `window.__ESP` gibi sabit imzalar bırakmaz).
+    pub fn random() -> Self {
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xA5A5_5A5A_F0F0_0F0F)
+            ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (ws_key_counter() as u64);
+        if s == 0 {
+            s = 1;
+        }
+
+        let mut next_ident = |prefix: &str| -> String {
+            const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+            let mut out = String::with_capacity(prefix.len() + 8);
+            out.push_str(prefix);
+            for _ in 0..8 {
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                let v = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                out.push(CHARS[(v as usize) % CHARS.len()] as char);
+            }
+            out
+        };
+
+        Self {
+            canvas_id: next_ident("ui_layer_"),
+            state_var: next_ident("_d"),
+            gen_var: next_ident("_g"),
+            fb_var: next_ident("_c"),
+            stop_var: next_ident("_s"),
+            fps_var: next_ident("_r"),
+            frames_var: next_ident("_f"),
+            err_var: next_ident("_e"),
+        }
+    }
+
+    pub fn build_install_js(&self) -> String {
+        let id = &self.canvas_id;
+        let st = &self.state_var;
+        let gn = &self.gen_var;
+        let fb = &self.fb_var;
+        let sp = &self.stop_var;
+        let fp = &self.fps_var;
+        let fr = &self.frames_var;
+        let er = &self.err_var;
+
+        format!(
+            r#"(function(){{
+  var ID='{id}';
+  window.{gn}=(window.{gn}||0)+1;
+  var GEN=window.{gn};
+  if(window.{sp}){{try{{window.{sp}();}}catch(e){{}}}}
+  document.querySelectorAll('#'+ID).forEach(function(n){{try{{n.style.display='none';n.style.visibility='hidden';}}catch(e){{}}}});
   var c=document.createElement('canvas');
   c.id=ID;
   c.style.cssText='position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;z-index:2147483647!important;pointer-events:none!important;display:block!important;';
-  function fit(){var w=(window.innerWidth||1920),h=(window.innerHeight||1080); if(c.width!==w)c.width=w; if(c.height!==h)c.height=h;}
+  function fit(){{var w=(window.innerWidth||1920),h=(window.innerHeight||1080); if(c.width!==w)c.width=w; if(c.height!==h)c.height=h;}}
   fit();
   var g=c.getContext('2d');
-  if(GEN===window.__hermesGen&&!window.__hermesFb){window.__ESP=window.__ESP||{boxes:[],lines:[],text:[],fills:[]};}
-  window.__hermesFb=c;
-  window.__fps=0; window.__frames=0; window.__hermesErr='';
+  if(GEN===window.{gn}&&!window.{fb}){{window.{st}=window.{st}||{{boxes:[],lines:[],text:[],fills:[]}};}}
+  window.{fb}=c;
+  window.{fp}=0; window.{fr}=0; window.{er}='';
   var stop=false,lastT=performance.now(),frames=0,mo=null;
-  function die(){stop=true;try{if(mo)mo.disconnect();}catch(e){}try{c.remove();}catch(e){}}
-  window.__hermesStop=function(){die();};
-  function loop(t){
+  function die(){{stop=true;try{{if(mo)mo.disconnect();}}catch(e){{}}try{{c.remove();}}catch(e){{}}}}
+  window.{sp}=function(){{die();}};
+  function loop(t){{
     if(stop) return;
-    if(GEN!==window.__hermesGen||window.__hermesFb!==c){die();return;}
-    try{
+    if(GEN!==window.{gn}||window.{fb}!==c){{die();return;}}
+    try{{
       fit();
       g.clearRect(0,0,c.width,c.height);
-      var d=window.__ESP||{};
+      var d=window.{st}||{{}};
       g.lineWidth=1.2;
       g.font='bold 14px Consolas, monospace';
-      // ImGui ile aynı referansı kullan: aksi halde iki katman üst üste binmeyip
-      // "ghost" (çift yazı) gibi görünür.
       g.textBaseline='top';
       g.textAlign='left';
-      (d.fills||[]).forEach(function(f){g.fillStyle=f.c||'#000';g.fillRect(f.x,f.y,f.w,f.h);});
-      (d.lines||[]).forEach(function(l){g.strokeStyle=l.c||'#ffff00';g.beginPath();g.moveTo(l.x1,l.y1);g.lineTo(l.x2,l.y2);g.stroke();});
-      (d.boxes||[]).forEach(function(b){g.strokeStyle=b.c||'#00ff00';g.strokeRect(b.x,b.y,b.w,b.h);});
-      (d.text||[]).forEach(function(s){g.fillStyle=s.c||'#fff';g.fillText(s.s,s.x,s.y);});
+      (d.fills||[]).forEach(function(f){{g.fillStyle=f.c||'#000';g.fillRect(f.x,f.y,f.w,f.h);}});
+      (d.lines||[]).forEach(function(l){{g.strokeStyle=l.c||'#ffff00';g.beginPath();g.moveTo(l.x1,l.y1);g.lineTo(l.x2,l.y2);g.stroke();}});
+      (d.boxes||[]).forEach(function(b){{g.strokeStyle=b.c||'#00ff00';g.strokeRect(b.x,b.y,b.w,b.h);}});
+      (d.text||[]).forEach(function(s){{g.fillStyle=s.c||'#fff';g.fillText(s.s,s.x,s.y);}});
       frames++;
-      if(t-lastT>=1000){window.__fps=Math.round(frames*1000/(t-lastT));frames=0;lastT=t;}
-      window.__frames++;
-    }catch(e){window.__hermesErr=String(e);}
+      if(t-lastT>=1000){{window.{fp}=Math.round(frames*1000/(t-lastT));frames=0;lastT=t;}}
+      window.{fr}++;
+    }}catch(e){{window.{er}=String(e);}}
     requestAnimationFrame(loop);
-  }
-  function ensure(){
-    if(stop||GEN!==window.__hermesGen||window.__hermesFb!==c) return;
-    // Eski enjeksiyonlardan kalan canvas'ları DOM'dan silmek MutationObserver'lar
-    // arasında ping-pong yaratıp sayfayı kilitliyor; onun yerine sadece gizle.
+  }}
+  function ensure(){{
+    if(stop||GEN!==window.{gn}||window.{fb}!==c) return;
     var all=document.querySelectorAll('#'+ID);
-    for(var i=0;i<all.length;i++){
+    for(var i=0;i<all.length;i++){{
       var n=all[i];
       if(n===c) continue;
-      try{ n.style.display='none'; n.style.visibility='hidden'; }catch(e){}
-    }
-    if(!c.isConnected){(document.body||document.documentElement).appendChild(c);}
-  }
+      try{{ n.style.display='none'; n.style.visibility='hidden'; }}catch(e){{}}
+    }}
+    if(!c.isConnected){{(document.body||document.documentElement).appendChild(c);}}
+  }}
   ensure();
   setTimeout(ensure,120); setTimeout(ensure,600); setTimeout(ensure,1500);
-  try{mo=new MutationObserver(function(){ensure();});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}
+  try{{mo=new MutationObserver(function(){{ensure();}});mo.observe(document.documentElement,{{childList:true,subtree:true}});}}catch(e){{}}
   requestAnimationFrame(loop);
-  return JSON.stringify({ok:true,href:location.href,w:c.width,h:c.height,gen:GEN});
-})()
-"#;
+  return JSON.stringify({{ok:true,href:location.href,w:c.width,h:c.height,gen:GEN}});
+}})()"#
+        )
+    }
+
+    #[inline]
+    pub fn update_js(&self, payload: &str) -> String {
+        format!("window.{}={payload};0", self.state_var)
+    }
+
+    #[inline]
+    pub fn clear_js(&self) -> String {
+        format!(
+            "window.{}={{boxes:[],lines:[],text:[],fills:[]}};0",
+            self.state_var
+        )
+    }
+
+    #[inline]
+    pub fn teardown_js(&self) -> String {
+        format!(
+            "(function(){{if(window.{sp})window.{sp}();var c=document.getElementById('{id}');if(c)c.remove();return 1;}})()",
+            sp = self.stop_var,
+            id = self.canvas_id
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ESP geometrisi -> overlay primitifleri
@@ -416,13 +508,15 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> String {
     }
 }
 
-/// ImGui çizim mantığının aynısını (kutu, hp barı, isim, silah, iskelet)
-/// canvas primitiflerine çevirir. Koordinatlar piksel, sol-üst orijinli.
+/// Ortak `crate::esp::build_esp_draw_list` çıktısını ve `crate::hud::HudModel`
+/// verisini Discord canvas primitiflerine çevirir. Koordinatlar piksel, sol-üst orijinli.
 pub fn build_primitives(
     snapshot: &EspSnapshot,
     settings: &VisualSettings,
     display_w: f32,
     display_h: f32,
+    hud_model: Option<&hud::HudModel>,
+    esp_enabled: bool,
 ) -> String {
     let mut boxes: Vec<serde_json::Value> = Vec::new();
     let mut lines: Vec<serde_json::Value> = Vec::new();
@@ -433,148 +527,110 @@ pub fn build_primitives(
         return "{\"boxes\":[],\"lines\":[],\"text\":[],\"fills\":[]}".to_string();
     }
 
-    for player in &snapshot.players {
-        if player.health <= 0 {
-            continue;
+    if esp_enabled {
+        let cmds = esp::build_esp_draw_list(snapshot, settings, display_w, display_h);
+
+        for f in cmds.filled_rects {
+            fills.push(serde_json::json!({
+                "x": f.x, "y": f.y, "w": f.w, "h": f.h, "c": f.color.to_css()
+            }));
         }
-        let is_enemy = snapshot.local_team != 0 && player.team != snapshot.local_team;
-        let base_color = if is_enemy {
-            rgba(255, 65, 65, 255)
-        } else {
-            rgba(65, 160, 255, 255)
-        };
 
-        let head_top = player.head_pos + Vec3::new(0.0, 0.0, 8.0);
-        let (fx, fy) = match snapshot
-            .view_matrix
-            .world_to_screen(&player.pos, display_w, display_h)
-        {
-            Some(p) => p,
-            None => continue,
-        };
-        let (_hx, hy) = match snapshot
-            .view_matrix
-            .world_to_screen(&head_top, display_w, display_h)
-        {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let box_height = (fy - hy).abs();
-        if box_height < 4.0 || box_height > display_h * 2.5 {
-            continue;
+        for l in cmds.lines {
+            lines.push(serde_json::json!({
+                "x1": l.x1, "y1": l.y1, "x2": l.x2, "y2": l.y2, "c": l.color.to_css()
+            }));
         }
-        let box_width = box_height * 0.45;
-        let min_x = fx - box_width / 2.0;
-        let min_y = hy.min(fy);
-        let max_y = hy.max(fy);
 
-        if settings.is_minimal {
-            if settings.show_box {
-                boxes.push(serde_json::json!({
-                    "x": min_x, "y": min_y, "w": box_width, "h": box_height, "c": base_color
+        for c in cmds.circles {
+            let steps = 8;
+            let col_str = c.color.to_css();
+            for i in 0..steps {
+                let a1 = (i as f32) * std::f32::consts::TAU / steps as f32;
+                let a2 = ((i + 1) as f32) * std::f32::consts::TAU / steps as f32;
+                lines.push(serde_json::json!({
+                    "x1": c.cx + c.radius * a1.cos(), "y1": c.cy + c.radius * a1.sin(),
+                    "x2": c.cx + c.radius * a2.cos(), "y2": c.cy + c.radius * a2.sin(),
+                    "c": col_str
                 }));
             }
-            continue;
         }
 
-        if settings.show_box {
-            // Dış/iç siyah kenarlık + renkli çerçeve
-            boxes.push(serde_json::json!({"x":min_x-1.0,"y":min_y-1.0,"w":box_width+2.0,"h":box_height+2.0,"c":rgba(0,0,0,255)}));
-            boxes.push(serde_json::json!({"x":min_x,"y":min_y,"w":box_width,"h":box_height,"c":base_color}));
-            boxes.push(serde_json::json!({"x":min_x+1.0,"y":min_y+1.0,"w":box_width-2.0,"h":box_height-2.0,"c":rgba(0,0,0,255)}));
-        }
-
-        if settings.show_health {
-            let bar_w = (box_width * 0.08).clamp(2.0, 4.0);
-            let bar_x = min_x - 4.0 - bar_w;
-            fills.push(serde_json::json!({
-                "x": bar_x - 1.0, "y": min_y - 1.0, "w": bar_w + 2.0, "h": box_height + 2.0,
-                "c": rgba(0, 0, 0, 220)
+        for r in cmds.rects {
+            boxes.push(serde_json::json!({
+                "x": r.x, "y": r.y, "w": r.w, "h": r.h, "c": r.color.to_css()
             }));
-            let hp_pct = (player.health.clamp(0, 100) as f32) / 100.0;
-            let hp_h = box_height * hp_pct;
-            let hp_top_y = max_y - hp_h;
-            let hp_color = if player.health > 60 {
-                rgba(50, 220, 50, 255)
-            } else if player.health > 25 {
-                rgba(240, 180, 20, 255)
+        }
+
+        for t in cmds.texts {
+            texts.push(serde_json::json!({
+                "x": t.x, "y": t.y, "s": t.text, "c": t.color.to_css()
+            }));
+        }
+    }
+
+    // ===== HUD gösterge paneli (Discord canvas) =====
+    // İçerik `crate::hud::build` ile üretilir; ImGui yoluyla birebir aynıdır.
+    if let Some(hud_model) = hud_model {
+        let x0 = hud::ORIGIN[0];
+        let y0 = hud::ORIGIN[1];
+        let pad = hud::PADDING;
+        let row_h = hud::ROW_HEIGHT;
+        let width = hud::PANEL_WIDTH;
+        let height = hud_model.height();
+        let x1 = x0 + width;
+        let y1 = y0 + height;
+        let text_x = x0 + pad + 4.0;
+
+        // Zemin + sol aksan
+        fills.push(serde_json::json!({
+            "x": x0, "y": y0, "w": width, "h": height, "c": rgba(11, 13, 17, 210)
+        }));
+        fills.push(serde_json::json!({
+            "x": x0, "y": y0, "w": 3.0, "h": height, "c": rgba(65, 160, 255, 255)
+        }));
+
+        // Kenarlık
+        for (a, b) in [
+            ((x0, y0), (x1, y0)),
+            ((x1, y0), (x1, y1)),
+            ((x1, y1), (x0, y1)),
+            ((x0, y1), (x0, y0)),
+        ] {
+            lines.push(serde_json::json!({
+                "x1": a.0, "y1": a.1, "x2": b.0, "y2": b.1,
+                "c": rgba(70, 80, 95, 160)
+            }));
+        }
+
+        let mut y = y0 + pad;
+        texts.push(serde_json::json!({
+            "x": text_x, "y": y, "s": hud_model.header, "c": rgba(65, 160, 255, 255)
+        }));
+        y += row_h;
+
+        // Canvas fontu bold 14px Consolas: genişlik ~8.4px/karakter (sağa hizalama için).
+        const CHAR_W: f32 = 8.4;
+        for row in &hud_model.rows {
+            texts.push(serde_json::json!({
+                "x": text_x, "y": y, "s": row.label, "c": rgba(150, 158, 170, 255)
+            }));
+            let value_color = if row.on {
+                rgba(90, 220, 120, 255)
             } else {
-                rgba(240, 40, 40, 255)
+                rgba(230, 90, 90, 255)
             };
-            fills.push(serde_json::json!({
-                "x": bar_x, "y": hp_top_y, "w": bar_w, "h": hp_h, "c": hp_color
+            let value_w = CHAR_W * row.detail.chars().count() as f32;
+            texts.push(serde_json::json!({
+                "x": x1 - pad - value_w, "y": y, "s": row.detail, "c": value_color
             }));
-            if player.health < 100 {
-                texts.push(serde_json::json!({
-                    "x": bar_x - 16.0, "y": hp_top_y - 2.0, "s": player.health.to_string(),
-                    "c": rgba(255, 255, 255, 255)
-                }));
-            }
+            y += row_h;
         }
 
-        if settings.show_name && !player.name.is_empty() {
-            texts.push(serde_json::json!({
-                "x": min_x, "y": min_y - 14.0, "s": player.name, "c": rgba(255, 255, 255, 255)
-            }));
-        }
-        if settings.show_weapon && !player.weapon.is_empty() {
-            texts.push(serde_json::json!({
-                "x": min_x, "y": max_y + 2.0, "s": player.weapon, "c": rgba(210, 210, 210, 255)
-            }));
-        }
-
-        if settings.show_skeleton && player.bone_list.len() >= 28 {
-            let sc = rgba(255, 255, 255, 200);
-            let pairs: &[(usize, usize)] = &[
-                (6, 5),
-                (5, 4),
-                (4, 2),
-                (2, 0),
-                (5, 8),
-                (8, 9),
-                (9, 10),
-                (5, 13),
-                (13, 14),
-                (14, 15),
-                (0, 22),
-                (22, 23),
-                (23, 24),
-                (0, 25),
-                (25, 26),
-                (26, 27),
-            ];
-            for &(b1, b2) in pairs {
-                let p1 = snapshot
-                    .view_matrix
-                    .world_to_screen(&player.bone_list[b1], display_w, display_h);
-                let p2 = snapshot
-                    .view_matrix
-                    .world_to_screen(&player.bone_list[b2], display_w, display_h);
-                if let (Some(a), Some(b)) = (p1, p2) {
-                    lines.push(serde_json::json!({
-                        "x1": a.0, "y1": a.1, "x2": b.0, "y2": b.1, "c": sc
-                    }));
-                }
-            }
-            if let Some(h) = snapshot
-                .view_matrix
-                .world_to_screen(&player.bone_list[6], display_w, display_h)
-            {
-                // Kafa: küçük daireyi 4 çizgiyle yaklaşık çiz
-                let r = (box_height * 0.07).clamp(2.5, 7.0);
-                let steps = 8;
-                for i in 0..steps {
-                    let a1 = (i as f32) * std::f32::consts::TAU / steps as f32;
-                    let a2 = ((i + 1) as f32) * std::f32::consts::TAU / steps as f32;
-                    lines.push(serde_json::json!({
-                        "x1": h.0 + r * a1.cos(), "y1": h.1 + r * a1.sin(),
-                        "x2": h.0 + r * a2.cos(), "y2": h.1 + r * a2.sin(),
-                        "c": sc
-                    }));
-                }
-            }
-        }
+        y += 3.0;
+        texts.push(serde_json::json!({
+            "x": text_x, "y": y, "s": hud_model.footer, "c": rgba(105, 112, 124, 255)
+        }));
     }
 
     serde_json::json!({
@@ -586,16 +642,18 @@ pub fn build_primitives(
 /// Oyun olmadan Discord overlay köprüsünü doğrular:
 /// `cs2ru.exe --discord-selftest`
 pub fn selftest() {
-    println!("[*] Discord overlay self-test başlıyor (CDP :{CDP_PORT})...");
-    let (mut sock, _size) = match connect_and_install(CDP_PORT) {
+    let port = cdp_port();
+    let tokens = SessionTokens::random();
+    println!("[*] Discord overlay self-test başlıyor (CDP :{port})...");
+    let (mut sock, _size) = match connect_and_install(port, &tokens) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[!] Bağlantı kurulamadı: {e}");
-            eprintln!("    Discord '--remote-debugging-port={CDP_PORT}' ile açık mı?");
+            eprintln!("    Discord '--remote-debugging-port={port}' ile açık mı?");
             std::process::exit(1);
         }
     };
-    println!("[+] Canvas enjekte edildi. 5 sn animasyon gönderiliyor...");
+    println!("[+] Canvas enjekte edildi (id={}). 5 sn animasyon gönderiliyor...", tokens.canvas_id);
 
     let t0 = std::time::Instant::now();
     let mut n: u32 = 0;
@@ -605,10 +663,10 @@ pub fn selftest() {
         let payload = format!(
             "{{\"boxes\":[{{\"x\":{x},\"y\":420,\"w\":120,\"h\":60,\"c\":\"#00ff00\"}}],\
               \"lines\":[{{\"x1\":960,\"y1\":540,\"x2\":{x},\"y2\":450,\"c\":\"#ffff00\"}}],\
-              \"text\":[{{\"x\":40,\"y\":60,\"s\":\"cs2ru selftest #{n}\",\"c\":\"#00ff00\"}}],\
+              \"text\":[{{\"x\":40,\"y\":60,\"s\":\"selftest #{n}\",\"c\":\"#00ff00\"}}],\
               \"fills\":[]}}"
         );
-        if let Err(e) = sock.eval(&format!("window.__ESP={payload};0")) {
+        if let Err(e) = sock.eval(&tokens.update_js(&payload)) {
             eprintln!("[!] Gönderim hatası: {e}");
             break;
         }
@@ -616,8 +674,11 @@ pub fn selftest() {
         thread::sleep(Duration::from_millis(16));
     }
 
-    match sock.eval("JSON.stringify({fps:window.__fps,frames:window.__frames,err:window.__hermesErr||''})")
-    {
+    let report_js = format!(
+        "JSON.stringify({{fps:window.{},frames:window.{},err:window.{}||''}})",
+        tokens.fps_var, tokens.frames_var, tokens.err_var
+    );
+    match sock.eval(&report_js) {
         Ok(v) => println!("[+] Sayfa raporu: {v}"),
         Err(e) => eprintln!("[!] Sayfa raporu alınamadı: {e}"),
     }
@@ -625,10 +686,10 @@ pub fn selftest() {
 }
 
 
-fn connect_and_install(port: u16) -> Result<(CdpSocket, (f32, f32)), String> {
+fn connect_and_install(port: u16, tokens: &SessionTokens) -> Result<(CdpSocket, (f32, f32)), String> {
     let ws = find_overlay_target(port)?;
     let mut sock = CdpSocket::connect(&ws)?;
-    sock.eval(INSTALL_JS)?;
+    sock.eval(&tokens.build_install_js())?;
     // Overlay sayfasının gerçek ölçüsü (CSS piksel) — koordinatlar buna göre üretilir
     let size_js = "JSON.stringify({w:window.innerWidth||1920,h:window.innerHeight||1080})";
     let size = sock
@@ -651,24 +712,46 @@ pub fn spawn(
     snapshot: Arc<RwLock<EspSnapshot>>,
     settings: Arc<RwLock<VisualSettings>>,
     visual_esp_enabled: Arc<AtomicBool>,
+    sound_esp_enabled: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    mode_controller: ModeController,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
-        .name("cs2ru-discord-overlay".into())
+        .name(obfstr!("worker-ipc").into())
         .spawn(move || {
-            println!("[*] Discord overlay köprüsü aranıyor (CDP :{CDP_PORT})...");
+            let port = cdp_port();
+            let tokens = SessionTokens::random();
+            println!(
+                "[*] Discord overlay köprüsü aranıyor (CDP :{port}, dom=#{})...",
+                tokens.canvas_id
+            );
             let mut sock: Option<CdpSocket> = None;
             let mut page_size: (f32, f32) = (1920.0, 1080.0);
             let mut dbg_tick = std::time::Instant::now();
             let mut last_err = String::new();
-            let mut announced = false;
+            let mut was_dormant = false;
+            let mut was_dormant_game = false;
             let interval = Duration::from_millis(1000 / SEND_HZ);
 
             while running.load(Ordering::Relaxed) {
                 let start = std::time::Instant::now();
 
+                // 1. Mod Kontrolü (Mutual Exclusion):
+                // Mod 1 (Basic) ve Mod 2 (DirectStealth) modlarında Discord Overlay tamamen dormant kalır.
+                if !mode_controller.is_discord_active() {
+                    if !was_dormant {
+                        if let Some(s) = sock.as_mut() {
+                            let _ = s.eval(&tokens.clear_js());
+                        }
+                        was_dormant = true;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                was_dormant = false;
+
                 if sock.is_none() {
-                    match connect_and_install(CDP_PORT) {
+                    match connect_and_install(port, &tokens) {
                         Ok((s, size)) => {
                             println!(
                                 "[+] Discord overlay canvas enjekte edildi (sayfa {}x{}).",
@@ -676,12 +759,12 @@ pub fn spawn(
                             );
                             page_size = size;
                             sock = Some(s);
-                            announced = true;
+                            last_err.clear();
                         }
                         Err(e) => {
                             if e != last_err {
                                 println!("[!] Discord overlay bağlantısı yok: {e}");
-                                println!("    (Discord '--remote-debugging-port={CDP_PORT}' ile açık olmalı)");
+                                println!("    (Discord '--remote-debugging-port={port}' ile açık olmalı)");
                                 last_err = e;
                             }
                             thread::sleep(Duration::from_secs(2));
@@ -690,25 +773,58 @@ pub fn spawn(
                     }
                 }
 
-                if !visual_esp_enabled.load(Ordering::Relaxed) {
-                    if announced {
+                // 2. In-Game Kontrolü: Oyun içinde değilken (menü/yükleme) çizim gönderme
+                let is_in_game = snapshot.read().map(|s| s.is_in_game).unwrap_or(false);
+                if !is_in_game {
+                    if !was_dormant_game {
                         if let Some(s) = sock.as_mut() {
-                            let _ = s.eval("window.__ESP={boxes:[],lines:[],text:[],fills:[]};0");
+                            let _ = s.eval(&tokens.clear_js());
                         }
+                        was_dormant_game = true;
                     }
-                    thread::sleep(Duration::from_millis(250));
+                    thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                was_dormant_game = false;
+
+                let esp_on = visual_esp_enabled.load(Ordering::Relaxed);
 
                 let payload = match (snapshot.read(), settings.read()) {
                     (Ok(snap), Ok(set)) => {
-                        build_primitives(&snap, &set, page_size.0, page_size.1)
+                        // HUD paneli: mod seviyesi + özellik ON/OFF (visual ESP kapalıyken de görünür).
+                        let hud_model = hud::build(
+                            &mode_controller,
+                            &set,
+                            esp_on,
+                            sound_esp_enabled.load(Ordering::Relaxed),
+                        );
+                        build_primitives(
+                            &snap,
+                            &set,
+                            page_size.0,
+                            page_size.1,
+                            hud_model.as_ref(),
+                            esp_on,
+                        )
                     }
                     _ => String::from("{\"boxes\":[],\"lines\":[],\"text\":[],\"fills\":[]}"),
                 };
 
                 if dbg_tick.elapsed() >= Duration::from_secs(2) {
                     dbg_tick = std::time::Instant::now();
+                    if let Some(s) = sock.as_mut() {
+                        if let Ok(sz_str) = s.eval(
+                            "JSON.stringify({w:window.innerWidth||1920,h:window.innerHeight||1080})",
+                        ) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&sz_str) {
+                                let w = v.get("w").and_then(|x| x.as_f64()).unwrap_or(1920.0) as f32;
+                                let h = v.get("h").and_then(|x| x.as_f64()).unwrap_or(1080.0) as f32;
+                                if w > 0.0 && h > 0.0 {
+                                    page_size = (w, h);
+                                }
+                            }
+                        }
+                    }
                     let n_players = snapshot.read().map(|s| s.players.len()).unwrap_or(0);
                     println!(
                         "[dbg] oyuncu={n_players} primitif_uzunluk={} ilk80={}",
@@ -718,13 +834,13 @@ pub fn spawn(
                 }
 
                 if let Some(s) = sock.as_mut() {
-                    let js = format!("window.__ESP={payload};0");
+                    let js = tokens.update_js(&payload);
                     match s.eval(&js) {
                         Ok(_) => {}
                         Err(e) => {
                             println!("[!] Discord overlay gönderimi koptu: {e}");
                             sock = None;
-                            announced = false;
+                            last_err.clear();
                             continue;
                         }
                     }
@@ -736,9 +852,114 @@ pub fn spawn(
                 }
             }
             if let Some(mut s) = sock {
-                let _ = s.eval("(function(){if(window.__hermesStop)window.__hermesStop();var c=document.getElementById('__hermes_fb');if(c)c.remove();return 1;})()");
+                let _ = s.eval(&tokens.teardown_js());
             }
             println!("[*] Discord overlay thread'i sonlandı.");
         })
         .expect("discord overlay thread'i başlatılamadı")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{EspSnapshot, VisualSettings};
+    use crate::mode::{ModeController, StealthMode};
+
+    fn test_snapshot() -> EspSnapshot {
+        EspSnapshot {
+            view_matrix: crate::matrix::ViewMatrix::default(),
+            local_team: 2,
+            has_local: true,
+            is_in_game: true,
+            map_name: "de_test".to_string(),
+            players: Vec::new(),
+            planted_c4: None,
+        }
+    }
+
+    /// Discord canvas yolu, ImGui yolunun ürettiği HUD modelini birebir tüketmeli:
+    /// aynı satır etiketleri ve aynı ON/OFF detayları payload'da bulunmalı.
+    #[test]
+    fn discord_payload_renders_same_hud_model_as_imgui() {
+        let mc = ModeController::new(StealthMode::Indirect);
+        let settings = VisualSettings::default_for_mode(sysmemkit::Mode::Indirect);
+        let model = hud::build(&mc, &settings, true, false).expect("HUD modeli üretilmeli");
+
+        let json = build_primitives(
+            &test_snapshot(),
+            &settings,
+            1920.0,
+            1080.0,
+            Some(&model),
+            false, // ESP kapalı: HUD yine de çizilmeli
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("payload JSON olmalı");
+
+        let texts: Vec<String> = value["text"]
+            .as_array()
+            .expect("text dizisi")
+            .iter()
+            .map(|t| t["s"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        assert!(!value["fills"].as_array().unwrap().is_empty(), "panel zemini çizilmeli");
+        assert!(!texts.is_empty());
+
+        // Başlık ve satırlar ImGui modelindeki içerikle aynı olmalı.
+        assert!(texts.iter().any(|t| t.contains(&model.header)), "başlık eksik: {:?}", model.header);
+        for row in &model.rows {
+            assert!(
+                texts.iter().any(|t| t.contains(row.label)),
+                "satır etiketi eksik: {} (payload: {:?})",
+                row.label,
+                texts
+            );
+            assert!(
+                texts.iter().any(|t| t.contains(&row.detail)),
+                "satır detayı eksik: {}/{}",
+                row.label,
+                row.detail
+            );
+        }
+
+        // Determinizm: aynı model + aynı snapshot aynı payload'ı üretir.
+        let again = build_primitives(
+            &test_snapshot(),
+            &settings,
+            1920.0,
+            1080.0,
+            Some(&model),
+            false,
+        );
+        assert_eq!(json, again);
+    }
+
+    /// HUD kapalıyken payload'da panel olmamalı (süreçler karışmamalı).
+    #[test]
+    fn payload_has_no_hud_when_disabled() {
+        let mc = ModeController::new(StealthMode::Indirect);
+        let settings = VisualSettings::default_for_mode(sysmemkit::Mode::Indirect);
+        mc.set_hud_visible(false);
+        assert!(hud::build(&mc, &settings, true, false).is_none());
+
+        let json = build_primitives(&test_snapshot(), &settings, 1920.0, 1080.0, None, false);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["text"].as_array().unwrap().is_empty());
+        assert!(value["fills"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_tokens_are_unique_and_signature_free() {
+        let t1 = SessionTokens::random();
+        let t2 = SessionTokens::random();
+        assert_ne!(t1.canvas_id, t2.canvas_id);
+        assert_ne!(t1.state_var, t2.state_var);
+
+        let js = t1.build_install_js();
+        assert!(!js.contains("__hermes"));
+        assert!(!js.contains("__ESP"));
+        assert!(js.contains(&t1.canvas_id));
+        assert!(js.contains(&t1.state_var));
+    }
+}
+

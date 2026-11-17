@@ -62,6 +62,7 @@ use windows::Win32::{
             SWP_NOACTIVATE,
             SWP_NOMOVE,
             SWP_NOSIZE,
+            SW_HIDE,
             SW_SHOWNOACTIVATE,
             WDA_EXCLUDEFROMCAPTURE,
             WDA_NONE,
@@ -320,6 +321,7 @@ impl System {
 
             frame_count: 0,
             debug_overlay_shown: false,
+            visible: true,
         };
 
         let mut perf = PerfTracker::new(PERF_RECORDS);
@@ -340,7 +342,18 @@ impl System {
                 }
 
                 Event::AboutToWait => {
-                    window.request_redraw();
+                    event_loop.set_control_flow(
+                        imgui_winit_support::winit::event_loop::ControlFlow::WaitUntil(
+                            Instant::now() + std::time::Duration::from_millis(16),
+                        ),
+                    );
+                    if !update(&mut runtime_controller) {
+                        event_loop.exit();
+                        return;
+                    }
+                    if runtime_controller.visible {
+                        window.request_redraw();
+                    }
                 }
 
                 Event::WindowEvent {
@@ -430,7 +443,11 @@ impl System {
                     };
 
                     /* render */
-                    renderer.render_frame(&mut perf, &window, draw_data);
+                    if runtime_controller.visible {
+                        renderer.render_frame(&mut perf, &window, draw_data);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
 
                     runtime_controller.frame_rendered();
                     perf.finish("render");
@@ -455,6 +472,7 @@ pub struct SystemRuntimeController {
     pub imgui_fonts: FontAtlasBuilder,
 
     debug_overlay_shown: bool,
+    visible: bool,
 
     active_tracker: ActiveTracker,
     mouse_input_system: MouseInputSystem,
@@ -481,9 +499,23 @@ impl SystemRuntimeController {
     fn frame_rendered(&mut self) {
         self.frame_count += 1;
         if self.frame_count == 1 {
-            /* initial frame */
-            unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+            /* initial frame: only show if controller was not hidden during initial update */
+            if self.visible {
+                unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+            }
             self.window_tracker.mark_force_update();
+        }
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        unsafe {
+            if visible {
+                ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.window_tracker.mark_force_update();
+            } else {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
         }
     }
 

@@ -1,59 +1,59 @@
 [offsets]
-entityList = 40931344
-viewMatrix = 39163456
-localPlayerController = 38973640
-globalVars = 35789496
-plantedC4 = 38509456
 buildNumber = 7023896
-
-[offsets.controller]
-m_iPing = 2104
-m_hPawn = 1724
-m_steamID = 1928
-m_iszPlayerName = 1788
-m_bIsLocalPlayerController = 1936
-m_pInGameMoneyServices = 2072
-m_iAccount = 64
-
-[offsets.pawn]
-m_vOldOrigin = 5284
-m_iHealth = 844
-m_iTeamNum = 999
-m_bIsScoped = 7888
-m_ArmorValue = 7936
-m_bIsDefusing = 7890
-m_pGameSceneNode = 816
-m_pClippingWeapon = 15808
-m_entitySpottedState = 7864
-m_bSpottedByMask = 12
-m_flFlashOverlayAlpha = 5380
+entityList = 40931344
+globalVars = 35789496
+localPlayerController = 38973640
+plantedC4 = 38509456
+viewMatrix = 39163456
 
 [offsets.bomb]
-m_isPlanted = 8
 m_bC4Activated = 4816
+m_isPlanted = 8
 m_nBombSite = 4748
 m_vecAbsOrigin = 200
 
 [offsets.bone]
 m_modelState = 320
 
+[offsets.controller]
+m_bIsLocalPlayerController = 1936
+m_hPawn = 1724
+m_iAccount = 64
+m_iPing = 2104
+m_iszPlayerName = 1788
+m_pInGameMoneyServices = 2072
+m_steamID = 1928
+
 [offsets.global_vars]
-maxClients = 16
 currentMapName = 384
 currentTime = 44
+maxClients = 16
+
+[offsets.pawn]
+m_ArmorValue = 7936
+m_bIsDefusing = 7890
+m_bIsScoped = 7888
+m_bSpottedByMask = 12
+m_entitySpottedState = 7864
+m_flFlashOverlayAlpha = 5380
+m_iHealth = 844
+m_iTeamNum = 999
+m_pClippingWeapon = 15808
+m_pGameSceneNode = 816
+m_vOldOrigin = 5284
 
 [offsets.signatures]
-viewMatrix = "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06"
-globalVars = "48 89 15 ?? ?? ?? ?? 48 89 42"
+buildNumber = "89 05 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? ff 15 ?? ?? ?? ?? 48 8b 0d"
 entityList = "48 8B 0D ?? ?? ?? ?? 48 89 7C 24 ?? 8B FA C1 EB"
+globalVars = "48 89 15 ?? ?? ?? ?? 48 89 42"
 localPlayerController = "48 8B 05 ?? ?? ?? ?? 41 89 BE"
 plantedC4 = "48 8b 15 ?? ?? ?? ?? 41 FF C0 48 8D 4C 24 ?? 44 89 05 ?? ?? ?? ??"
+viewMatrix = "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06"
 weaponC4 = "48 89 05 ?? ?? ?? ?? F7 C1 ?? ?? ?? ?? 74 ?? 81 E1 ?? ?? ?? ?? 89 0D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 89 1D ?? ?? ?? ?? EB ?? 48 8B 15 ?? ?? ?? ?? 48 8B 5C 24 ?? FF C0 89 05 ?? ?? ?? ?? 48 8B C6 48 89 34 EA 80 BE"
-buildNumber = "89 05 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? ff 15 ?? ?? ?? ?? 48 8b 0d"
 
 [options]
-glowESPEnabled = true
-triggerBotEnabled = true
 autoBHOPEnabled = true
-soundESPEnabled = true
+glowESPEnabled = true
 rcsEnabled = true
+soundESPEnabled = true
+triggerBotEnabled = true

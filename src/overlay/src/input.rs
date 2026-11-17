@@ -97,10 +97,7 @@ impl KeyboardInputSystem {
             if let Some(button) = mouse_button {
                 io.add_mouse_button_event(button, pressed);
             } else if let Some(key) = to_imgui_key(vkey) {
-                // println!("Key toggle {:?}: {}", key, pressed);
                 io.add_key_event(key, pressed);
-            } else {
-                println!("Missing ImGui key for {:?}", vkey);
             }
         }
     }

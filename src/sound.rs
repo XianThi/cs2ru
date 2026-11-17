@@ -26,8 +26,20 @@ impl StereoSine {
     }
 
     pub fn audio_thread(rx: std::sync::mpsc::Receiver<SoundEvent>) {
-        let (_stream, handle) = OutputStream::try_default().unwrap();
-        let sink = Sink::try_new(&handle).unwrap();
+        let (_stream, handle) = match OutputStream::try_default() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[!] Ses çıkış aygıtı başlatılamadı ({e}); Sound ESP devre dışı.");
+                return;
+            }
+        };
+        let sink = match Sink::try_new(&handle) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[!] Ses kanalı (Sink) oluşturulamadı ({e}); Sound ESP devre dışı.");
+                return;
+            }
+        };
 
         let mut last_play = Instant::now();
 
